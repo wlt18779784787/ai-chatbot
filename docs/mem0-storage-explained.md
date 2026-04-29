@@ -29,7 +29,7 @@
    - 历史和消息缓存使用 `SQLite`
 
 4. 模型层
-   - 主聊天模型：`deepseek/deepseek-v3.2`
+  - 主聊天模型：`moonshot/kimi2.5`
    - 记忆 embedding 模型：`qwen/qwen3-embedding-4b`
    - 当前都通过 `OpenRouter` 的 OpenAI-compatible 接口调用
 

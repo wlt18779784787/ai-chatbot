@@ -2,6 +2,10 @@
 Compatibility patches for Mem0 integrations used by this project.
 """
 
+import os
+
+from config import get_openrouter_reasoning_config
+
 
 def apply_mem0_milvus_dense_only_patch():
     """
@@ -60,3 +64,47 @@ def apply_mem0_milvus_dense_only_patch():
     milvus_module.MilvusDB.create_col = create_col
     milvus_module.MilvusDB.update = update
     milvus_module._dense_only_patch_applied = True
+
+
+def apply_mem0_openrouter_reasoning_config_patch():
+    """
+    Patch Mem0's OpenRouter LLM calls to respect the project's reasoning switch.
+
+    Mem0 uses the OpenAI SDK for OpenRouter traffic. We wrap the SDK call site
+    so every chat completion request sent through Mem0 uses the same reasoning
+    configuration as the primary chat request.
+    """
+    try:
+        from mem0.llms import openai as openai_module
+    except (ImportError, ModuleNotFoundError):
+        return
+
+    if getattr(openai_module, "_openrouter_reasoning_config_patch_applied", False):
+        return
+
+    original_init = openai_module.OpenAILLM.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return
+
+        completions = getattr(getattr(self.client, "chat", None), "completions", None)
+        create = getattr(completions, "create", None)
+        if create is None or getattr(completions, "_no_reasoning_wrapper_applied", False):
+            return
+
+        def create_with_reasoning_config(*create_args, **create_kwargs):
+            reasoning = get_openrouter_reasoning_config()
+            if reasoning is not None:
+                extra_body = dict(create_kwargs.get("extra_body") or {})
+                extra_body["reasoning"] = reasoning
+                create_kwargs["extra_body"] = extra_body
+            return create(*create_args, **create_kwargs)
+
+        completions.create = create_with_reasoning_config
+        completions._no_reasoning_wrapper_applied = True
+
+    openai_module.OpenAILLM.__init__ = patched_init
+    openai_module._openrouter_reasoning_config_patch_applied = True

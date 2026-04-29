@@ -5,6 +5,8 @@ APP_NAME="${APP_NAME:-ai-chatbot}"
 IMAGE_NAME="${IMAGE_NAME:-ai-chatbot:latest}"
 HOST_PORT="${HOST_PORT:-8090}"
 CONTAINER_PORT="${CONTAINER_PORT:-8090}"
+HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-12}"
+HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 DATA_DIR="${PROJECT_DIR}/data"
@@ -36,7 +38,7 @@ require_command() {
 }
 
 require_port_free() {
-  if ss -ltn | awk '{print $4}' | grep -q ":${HOST_PORT}$"; then
+  if ss -ltn | awk '{print $4}' | grep -Eq "(^|:|])${HOST_PORT}$"; then
     fail "端口 ${HOST_PORT} 已被占用，立即停止部署"
   fi
 }
@@ -56,6 +58,23 @@ require_env_file() {
 require_env_value() {
   local key="$1"
   grep -Eq "^${key}=.+" "${ENV_FILE}" || fail ".env 缺少必要配置: ${key}"
+}
+
+require_milvus_target() {
+  local milvus_host
+  local milvus_url
+  milvus_host="$(grep -E '^MILVUS_HOST=' "${ENV_FILE}" | cut -d= -f2- || true)"
+  milvus_url="$(grep -E '^MILVUS_URL=' "${ENV_FILE}" | cut -d= -f2- || true)"
+
+  if [ -n "${milvus_host}" ] && [ "${milvus_host}" != "localhost" ] && [ "${milvus_host}" != "127.0.0.1" ]; then
+    return 0
+  fi
+
+  if [ -n "${milvus_url}" ] && [[ "${milvus_url}" != *"localhost"* ]] && [[ "${milvus_url}" != *"127.0.0.1"* ]]; then
+    return 0
+  fi
+
+  fail "Milvus 地址不能使用 localhost/127.0.0.1；阿里云 ECS 容器内无法访问宿主机本地 Milvus"
 }
 
 require_runtime_dirs() {
@@ -87,10 +106,18 @@ health_check() {
   curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null
 }
 
-log "[1/8] 检查端口 ${HOST_PORT} 是否被占用"
-require_port_free
+wait_for_health_check() {
+  local attempt
+  for attempt in $(seq 1 "${HEALTH_CHECK_RETRIES}"); do
+    if health_check; then
+      return 0
+    fi
+    sleep "${HEALTH_CHECK_INTERVAL}"
+  done
+  return 1
+}
 
-log "[2/8] 检查项目结构和环境文件"
+log "[1/9] 检查项目结构和环境文件"
 require_project_layout
 require_env_file
 require_env_value "OPENROUTER_API_KEY"
@@ -100,26 +127,26 @@ require_env_value "MEM0_EMBED_MODEL"
 require_env_value "MEM0_EMBEDDING_DIMS"
 require_env_value "WINDOW_SIZE"
 require_env_value "MAX_WORKERS"
+require_milvus_target
 
-log "[3/8] 检查 Docker 和宿主机运行目录"
+log "[2/9] 检查 Docker、curl 和宿主机运行目录"
 require_docker_ready
+require_command curl
+require_command ss
 require_runtime_dirs
 
-log "[4/8] 构建镜像前复检"
-require_docker_ready
-require_project_layout
-docker build -t "${IMAGE_NAME}" "${PROJECT_DIR}"
-
-log "[5/8] 清理旧容器前复检"
-require_docker_ready
+log "[3/9] 清理旧容器"
 if container_exists; then
   docker rm -f "${APP_NAME}" >/dev/null 2>&1 || fail "删除旧容器失败: ${APP_NAME}"
 fi
 
-log "[6/8] 启动容器前复检"
+log "[4/9] 检查宿主机端口 ${HOST_PORT} 是否可用"
 require_port_free
-require_env_file
-require_runtime_dirs
+
+log "[5/9] 构建镜像"
+docker build -t "${IMAGE_NAME}" "${PROJECT_DIR}"
+
+log "[6/9] 启动容器"
 docker run -d \
   --name "${APP_NAME}" \
   --restart unless-stopped \
@@ -130,18 +157,17 @@ docker run -d \
   -v "${RUNTIME_DIR}:/app/runtime" \
   "${IMAGE_NAME}" >/dev/null
 
-log "[7/8] 健康检查前复检"
+log "[7/9] 检查容器运行状态"
 require_container_running
-require_command curl
-sleep 5
 
-log "[8/8] 执行健康检查"
-if ! health_check; then
+log "[8/9] 等待健康检查通过"
+if ! wait_for_health_check; then
   echo "服务启动失败，打印容器日志" >&2
   print_container_logs
   exit 1
 fi
 
+log "[9/9] 输出部署结果"
 log "部署成功"
 log "访问地址: http://127.0.0.1:${HOST_PORT}/"
 log "查看日志: docker logs -f ${APP_NAME}"

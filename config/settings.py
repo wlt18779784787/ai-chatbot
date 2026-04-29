@@ -11,6 +11,13 @@ BASE_DIR = Path(__file__).parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Config:
     # === API ===
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
@@ -18,7 +25,8 @@ class Config:
     OPENROUTER_CHAT_URL: str = f"{OPENROUTER_API_BASE}/chat/completions"
 
     # === Models ===
-    MODEL_NAME: str = os.getenv("MODEL_NAME", "deepseek/deepseek-v3.2")
+    MODEL_NAME: str = os.getenv("MODEL_NAME", "moonshot/kimi2.5")
+    REASONING_ENABLED: bool = _get_bool_env("REASONING_ENABLED", False)
     MEM0_EMBED_MODEL: str = os.getenv("MEM0_EMBED_MODEL", "qwen/qwen3-embedding-4b")
     MEM0_EMBEDDING_DIMS: int = int(os.getenv("MEM0_EMBEDDING_DIMS", "2560"))
 
@@ -53,9 +61,17 @@ def _build_milvus_token():
     return None
 
 
+def get_openrouter_reasoning_config():
+    reasoning_enabled = getattr(globals().get("config"), "REASONING_ENABLED", Config.REASONING_ENABLED)
+    if reasoning_enabled:
+        return None
+    return {"effort": "none", "exclude": True}
+
+
 def get_mem0_oss_config() -> dict:
     """Build Mem0 OSS configuration for OpenRouter + Milvus."""
     return {
+        "reasoning_enabled": Config.REASONING_ENABLED,
         "llm": {
             "provider": "openai",
             "config": {

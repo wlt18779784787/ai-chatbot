@@ -215,14 +215,63 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertIn("role=user", output.getvalue())
         self.assertIn("你好", output.getvalue())
 
+    def test_call_model_disables_reasoning_when_switch_off(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "ok"}}]},
+            },
+        )()
+
+        with (
+            patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
+            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "REASONING_ENABLED", False),
+        ):
+            content = chat_core.call_model([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(post_mock.call_count, 1)
+        _, kwargs = post_mock.call_args
+        self.assertEqual(kwargs["json"]["model"], "moonshot/kimi2.5")
+        self.assertEqual(kwargs["json"]["reasoning"], {"effort": "none", "exclude": True})
+
+    def test_call_model_omits_reasoning_when_switch_on(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "ok"}}]},
+            },
+        )()
+
+        with (
+            patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
+            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "REASONING_ENABLED", True),
+        ):
+            content = chat_core.call_model([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(post_mock.call_count, 1)
+        _, kwargs = post_mock.call_args
+        self.assertEqual(kwargs["json"]["model"], "moonshot/kimi2.5")
+        self.assertNotIn("reasoning", kwargs["json"])
+
     def test_chat_duration_covers_full_request_not_just_model_call(self):
         fake_memory = FakeMemoryStore()
-        _, chat_core = self._load_chat_core(fake_memory)
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
 
         perf_counter_values = iter([100.0, 104.0, 110.0, 112.0])
 
         def fake_build_messages(user_input, session):
-            chat_core_module = sys.modules["core.chat_core"]
             chat_core_module.time.perf_counter()
             chat_core_module.time.perf_counter()
             return [
@@ -231,7 +280,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             ], {}
 
         with (
-            patch("core.chat_core.time.perf_counter", side_effect=lambda: next(perf_counter_values)),
+            patch.object(chat_core_module.time, "perf_counter", side_effect=lambda: next(perf_counter_values)),
             patch.object(chat_core, "_build_messages_with_timings", side_effect=fake_build_messages),
             patch.object(chat_core, "_print_prompt_messages"),
             patch.object(chat_core, "call_model", return_value="ok"),
@@ -345,6 +394,107 @@ class Mem0CompatPatchTests(unittest.TestCase):
         self.assertEqual(len(store.client.created["schema"]["fields"]), 3)
         self.assertEqual(len(store.client.created["index_calls"]), 1)
         self.assertEqual(store.client.created["index_calls"][0]["field_name"], "vectors")
+
+    def test_openrouter_patch_adds_no_reasoning_extra_body_when_switch_off(self):
+        fake_openai_module = types.ModuleType("mem0.llms.openai")
+
+        class FakeOpenAILLM:
+            def __init__(self, config=None):
+                self.config = config
+                self.calls = []
+
+                class FakeCompletions:
+                    def __init__(inner_self, recorder):
+                        inner_self._recorder = recorder
+
+                    def create(inner_self, **kwargs):
+                        inner_self._recorder.append(kwargs)
+                        return {"ok": True}
+
+                self.client = types.SimpleNamespace(
+                    chat=types.SimpleNamespace(
+                        completions=FakeCompletions(self.calls)
+                    )
+                )
+
+            def generate_response(self, messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
+                params = {
+                    "model": "moonshot/kimi2.5",
+                    "messages": messages,
+                }
+                params.update(kwargs)
+                return self.client.chat.completions.create(**params)
+
+        fake_openai_module.OpenAILLM = FakeOpenAILLM
+
+        sys.modules.pop("core.mem0_compat", None)
+
+        with patch.dict(sys.modules, {"mem0.llms.openai": fake_openai_module}), patch.dict(
+            "os.environ",
+            {"OPENROUTER_API_KEY": "or-key", "REASONING_ENABLED": "false"},
+            clear=False,
+        ):
+            import core.mem0_compat as compat
+
+            importlib.reload(compat)
+            compat.apply_mem0_openrouter_reasoning_config_patch()
+            llm = fake_openai_module.OpenAILLM()
+            llm.generate_response([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(
+            llm.calls[0]["extra_body"]["reasoning"],
+            {"effort": "none", "exclude": True},
+        )
+
+    def test_openrouter_patch_omits_reasoning_extra_body_when_switch_on(self):
+        fake_openai_module = types.ModuleType("mem0.llms.openai")
+
+        class FakeOpenAILLM:
+            def __init__(self, config=None):
+                self.config = config
+                self.calls = []
+
+                class FakeCompletions:
+                    def __init__(inner_self, recorder):
+                        inner_self._recorder = recorder
+
+                    def create(inner_self, **kwargs):
+                        inner_self._recorder.append(kwargs)
+                        return {"ok": True}
+
+                self.client = types.SimpleNamespace(
+                    chat=types.SimpleNamespace(
+                        completions=FakeCompletions(self.calls)
+                    )
+                )
+
+            def generate_response(self, messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
+                params = {
+                    "model": "moonshot/kimi2.5",
+                    "messages": messages,
+                }
+                params.update(kwargs)
+                return self.client.chat.completions.create(**params)
+
+        fake_openai_module.OpenAILLM = FakeOpenAILLM
+
+        sys.modules.pop("core.mem0_compat", None)
+
+        with patch.dict(sys.modules, {"mem0.llms.openai": fake_openai_module}), patch.dict(
+            "os.environ",
+            {"OPENROUTER_API_KEY": "or-key", "REASONING_ENABLED": "true"},
+            clear=False,
+        ):
+            import core.mem0_compat as compat
+
+            importlib.reload(compat)
+            compat.apply_mem0_openrouter_reasoning_config_patch()
+            llm = fake_openai_module.OpenAILLM()
+            llm.generate_response([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(len(llm.calls), 1)
+        self.assertNotIn("extra_body", llm.calls[0])
 
 
 if __name__ == "__main__":

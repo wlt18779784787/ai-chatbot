@@ -14,14 +14,15 @@ from zoneinfo import ZoneInfo
 import requests
 from mem0 import Memory
 
-from config import config, get_mem0_oss_config
-from core.mem0_compat import apply_mem0_milvus_dense_only_patch
+from config import config, get_mem0_oss_config, get_openrouter_reasoning_config
+from core.mem0_compat import apply_mem0_milvus_dense_only_patch, apply_mem0_openrouter_reasoning_config_patch
 
 # 用线程池承接较慢的 IO 操作，避免把记忆保存阻塞在主请求路径里。
 executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 
 # 启动时先打补丁，关闭 mem0 在 Milvus 上的 BM25 / sparse 索引逻辑。
 apply_mem0_milvus_dense_only_patch()
+apply_mem0_openrouter_reasoning_config_patch()
 
 INITIAL_MEMORY_BATCH_ROUNDS = 5
 MEMORY_BATCH_ROUNDS = 5
@@ -190,15 +191,26 @@ class ChatCore:
 
     def call_model(self, messages: List[dict]) -> str:
         """调用 OpenRouter 聊天模型。"""
+        model_call_started = time.perf_counter()
+        request_payload = {
+            "model": config.MODEL_NAME,
+            "messages": messages,
+        }
+        reasoning = get_openrouter_reasoning_config()
+        if reasoning is not None:
+            request_payload["reasoning"] = reasoning
+
         response = requests.post(
             config.OPENROUTER_CHAT_URL,
             headers={
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={"model": config.MODEL_NAME, "messages": messages},
+            json=request_payload,
             timeout=60,
         )
+        model_call_duration = time.perf_counter() - model_call_started
+        print(f"模型调用耗时 | model={config.MODEL_NAME} | duration={model_call_duration:.2f}s")
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
@@ -221,7 +233,9 @@ class ChatCore:
 
         memory_search_started = time.perf_counter()
         memories = self.search_memories(memory_query, session.scope)
-        timings["memory_search_duration"] = time.perf_counter() - memory_search_started
+        memory_search_duration = time.perf_counter() - memory_search_started
+        timings["memory_search_duration"] = memory_search_duration
+        print(f"记忆检索耗时 | user_id={session.scope.user_id} | agent_id={session.scope.agent_id} | duration={memory_search_duration:.2f}s")
 
         prompt_build_started = time.perf_counter()
         memory_context = "\n".join([f"- {item['memory']}" for item in memories]) if memories else "暂无"

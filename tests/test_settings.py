@@ -5,11 +5,49 @@ from unittest.mock import patch
 
 
 class Mem0SettingsTests(unittest.TestCase):
+    def test_default_model_name_is_kimi_2_5(self):
+        import sys
+
+        sys.modules.pop("config.settings", None)
+        with patch.dict(os.environ, {}, clear=True), patch("dotenv.load_dotenv", return_value=False):
+            import config.settings as settings
+
+            importlib.reload(settings)
+
+        self.assertEqual(settings.Config.MODEL_NAME, "moonshot/kimi2.5")
+        self.assertFalse(settings.Config.REASONING_ENABLED)
+
+    def test_openrouter_reasoning_settings_disable_reasoning_when_switch_off(self):
+        import sys
+
+        sys.modules.pop("config.settings", None)
+        with patch.dict(os.environ, {"REASONING_ENABLED": "false"}, clear=True):
+            import config.settings as settings
+
+            importlib.reload(settings)
+
+        self.assertEqual(
+            settings.get_openrouter_reasoning_config(),
+            {"effort": "none", "exclude": True},
+        )
+
+    def test_openrouter_reasoning_settings_omit_reasoning_when_switch_on(self):
+        import sys
+
+        sys.modules.pop("config.settings", None)
+        with patch.dict(os.environ, {"REASONING_ENABLED": "true"}, clear=True):
+            import config.settings as settings
+
+            importlib.reload(settings)
+
+        self.assertIsNone(settings.get_openrouter_reasoning_config())
+
     def test_get_mem0_oss_config_builds_openrouter_milvus_config(self):
         env = {
             "OPENROUTER_API_KEY": "or-key",
             "OPENROUTER_API_BASE": "https://openrouter.ai/api/v1",
-            "MODEL_NAME": "deepseek/deepseek-v3.2",
+            "MODEL_NAME": "moonshot/kimi2.5",
+            "REASONING_ENABLED": "false",
             "MEM0_EMBED_MODEL": "qwen/qwen3-embedding-4b",
             "MEM0_EMBEDDING_DIMS": "2560",
             "MILVUS_HOST": "",
@@ -31,8 +69,9 @@ class Mem0SettingsTests(unittest.TestCase):
             config = settings.get_mem0_oss_config()
 
         self.assertEqual(config["llm"]["provider"], "openai")
-        self.assertEqual(config["llm"]["config"]["model"], "deepseek/deepseek-v3.2")
+        self.assertEqual(config["llm"]["config"]["model"], "moonshot/kimi2.5")
         self.assertEqual(config["llm"]["config"]["openai_base_url"], "https://openrouter.ai/api/v1")
+        self.assertFalse(config["reasoning_enabled"])
         self.assertEqual(config["embedder"]["provider"], "openai")
         self.assertEqual(config["embedder"]["config"]["model"], "qwen/qwen3-embedding-4b")
         self.assertEqual(config["embedder"]["config"]["embedding_dims"], 2560)
@@ -48,7 +87,8 @@ class Mem0SettingsTests(unittest.TestCase):
     def test_get_mem0_oss_config_builds_milvus_url_and_token_from_host_credentials(self):
         env = {
             "OPENROUTER_API_KEY": "or-key",
-            "MODEL_NAME": "deepseek/deepseek-v3.2",
+            "MODEL_NAME": "moonshot/kimi2.5",
+            "REASONING_ENABLED": "true",
             "MEM0_EMBED_MODEL": "qwen/qwen3-embedding-4b",
             "MEM0_EMBEDDING_DIMS": "2560",
             "MILVUS_HOST": "8.155.168.98",
@@ -67,6 +107,7 @@ class Mem0SettingsTests(unittest.TestCase):
 
         self.assertEqual(config["vector_store"]["config"]["url"], "http://8.155.168.98:19530")
         self.assertEqual(config["vector_store"]["config"]["token"], "root:secret")
+        self.assertTrue(config["reasoning_enabled"])
 
 
 if __name__ == "__main__":
