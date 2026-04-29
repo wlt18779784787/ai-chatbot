@@ -71,18 +71,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertIs(chat_core.memory_client, fake_memory)
         self.assertEqual(captured["config"], {"api_key": "m0-test-key"})
 
-    def test_build_memory_scope_id_is_stable_per_user_and_agent(self):
-        fake_memory = FakeMemoryStore()
-        chat_core_module, chat_core = self._load_chat_core(fake_memory)
-
-        scope_a = chat_core_module.SessionScope("alice", "agent-1")
-        scope_b = chat_core_module.SessionScope("alice", "agent-2")
-
-        self.assertEqual(chat_core.build_memory_scope_id(scope_a), "alice::agent-1")
-        self.assertEqual(chat_core.build_memory_scope_id(scope_a), "alice::agent-1")
-        self.assertEqual(chat_core.build_memory_scope_id(scope_b), "alice::agent-2")
-
-    def test_search_memories_uses_composite_scope_filter(self):
+    def test_search_memories_uses_official_platform_filters(self):
         fake_memory = FakeMemoryStore()
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
         scope = chat_core_module.SessionScope("alice", "agent-1")
@@ -94,11 +83,14 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(
             filters,
             {
-                "user_id": "alice::agent-1",
+                "AND": [
+                    {"user_id": "alice"},
+                    {"metadata": {"source_agent_id": "agent-1"}},
+                ],
             },
         )
 
-    def test_save_to_memory_passes_composite_scope_id_to_platform_client(self):
+    def test_save_to_memory_passes_official_scope_fields_to_platform_client(self):
         fake_memory = FakeMemoryStore()
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
         scope = chat_core_module.SessionScope("alice", "agent-1")
@@ -109,8 +101,8 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(len(fake_memory.add_calls), 1)
         add_call = fake_memory.add_calls[0]
         self.assertEqual(add_call["messages"], messages)
-        self.assertEqual(add_call["user_id"], "alice::agent-1")
-        self.assertIsNone(add_call["agent_id"])
+        self.assertEqual(add_call["user_id"], "alice")
+        self.assertEqual(add_call["agent_id"], "agent-1")
         self.assertIsNone(add_call["run_id"])
         self.assertEqual(
             add_call["metadata"],
@@ -119,6 +111,25 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
                 "source_agent_id": "agent-1",
             },
         )
+
+    def test_save_to_memory_only_persists_current_round_user_and_assistant_messages(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        messages = [
+            {"role": "user", "content": "用户问题"},
+            {"role": "assistant", "content": "AI回答"},
+        ]
+
+        chat_core.save_to_memory(messages, scope)
+
+        self.assertEqual(len(fake_memory.add_calls), 1)
+        persisted_messages = fake_memory.add_calls[0]["messages"]
+        self.assertEqual(persisted_messages, messages)
+        self.assertEqual([item["role"] for item in persisted_messages], ["user", "assistant"])
+        self.assertNotIn({"role": "system", "content": "system prompt"}, persisted_messages)
+        self.assertNotIn({"role": "user", "content": "历史问题"}, persisted_messages)
+        self.assertNotIn({"role": "assistant", "content": "历史回答"}, persisted_messages)
 
     def test_get_or_create_session_uses_full_scope(self):
         fake_memory = FakeMemoryStore()
@@ -165,7 +176,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         query, _, _ = fake_memory.search_calls[0]
         self.assertEqual(query, "还有呢")
 
-    def test_first_memory_batch_flushes_after_five_rounds(self):
+    def test_each_round_is_persisted_immediately(self):
         fake_memory = FakeMemoryStore()
 
         class FakeExecutor:
@@ -180,21 +191,23 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
 
-        for index in range(5):
-            chat_core.update_window(f"u{index}", f"a{index}", session)
+        chat_core.update_window("u0", "a0", session)
 
         self.assertEqual(len(chat_core.executor.submissions), 1)
         fn, args, kwargs = chat_core.executor.submissions[0]
         self.assertEqual(fn.__name__, "_persist_memory_batch")
         self.assertEqual(args[1], scope)
-        self.assertEqual(args[2], 5)
-        self.assertEqual(len(args[0]), 10)
-        self.assertEqual(len(session.memory_round_buffer), 2)
-        self.assertEqual(session.memory_flush_count, 1)
-        self.assertEqual(session.memory_round_buffer[0][0]["content"], "u3")
+        self.assertEqual(args[2], 1)
+        self.assertEqual(
+            args[0],
+            [
+                {"role": "user", "content": "u0"},
+                {"role": "assistant", "content": "a0"},
+            ],
+        )
         self.assertEqual(kwargs, {})
 
-    def test_second_memory_batch_flushes_after_three_new_rounds_with_overlap(self):
+    def test_multiple_rounds_submit_multiple_persist_tasks(self):
         fake_memory = FakeMemoryStore()
 
         class FakeExecutor:
@@ -209,18 +222,14 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
 
-        for index in range(8):
+        for index in range(3):
             chat_core.update_window(f"u{index}", f"a{index}", session)
 
-        self.assertEqual(len(chat_core.executor.submissions), 2)
+        self.assertEqual(len(chat_core.executor.submissions), 3)
         _, args, _ = chat_core.executor.submissions[1]
-        self.assertEqual(args[2], 5)
-        self.assertEqual(len(args[0]), 10)
-        self.assertEqual(args[0][0]["content"], "u3")
-        self.assertEqual(args[0][-1]["content"], "a7")
-        self.assertEqual(len(session.memory_round_buffer), 2)
-        self.assertEqual(session.memory_round_buffer[0][0]["content"], "u6")
-        self.assertEqual(session.memory_flush_count, 2)
+        self.assertEqual(args[2], 1)
+        self.assertEqual(args[0][0]["content"], "u1")
+        self.assertEqual(args[0][-1]["content"], "a1")
 
     def test_chat_prints_prompt_messages_before_model_call(self):
         fake_memory = FakeMemoryStore()

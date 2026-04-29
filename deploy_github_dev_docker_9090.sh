@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="${APP_NAME:-ai-chatbot}"
 IMAGE_NAME="${IMAGE_NAME:-ai-chatbot:dev}"
 HOST_PORT="${HOST_PORT:-9090}"
-CONTAINER_PORT="${CONTAINER_PORT:-8090}"
+CONTAINER_PORT="${CONTAINER_PORT:-9090}"
 HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-12}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +15,7 @@ GIT_REMOTE="${GIT_REMOTE:-origin}"
 TARGET_BRANCH="${TARGET_BRANCH:-dev}"
 APT_MIRROR_HOST="${APT_MIRROR_HOST:-mirrors.aliyun.com}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
+PUBLIC_IP="${PUBLIC_IP:-}"
 SERVER_IP=""
 
 log() {
@@ -115,11 +116,18 @@ wait_for_health_check() {
 
 resolve_server_ip() {
   local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  if [ -z "${ip}" ]; then
-    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i = 1; i <= NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+
+  if [ -n "${PUBLIC_IP}" ]; then
+    SERVER_IP="${PUBLIC_IP}"
+    return
   fi
-  SERVER_IP="${ip:-127.0.0.1}"
+
+  ip="$(curl -fsS https://api.ipify.org 2>/dev/null || true)"
+  if [ -z "${ip}" ]; then
+    ip="$(curl -fsS https://ifconfig.me 2>/dev/null || true)"
+  fi
+  [ -n "${ip}" ] || fail "无法解析公网 IP，请先设置 PUBLIC_IP 环境变量后再部署"
+  SERVER_IP="${ip}"
 }
 
 force_sync_dev_branch() {
