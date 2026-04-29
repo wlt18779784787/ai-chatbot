@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="${APP_NAME:-ai-chatbot}"
-IMAGE_NAME="${IMAGE_NAME:-ai-chatbot:latest}"
+IMAGE_NAME="${IMAGE_NAME:-ai-chatbot:dev}"
 HOST_PORT="${HOST_PORT:-9090}"
 CONTAINER_PORT="${CONTAINER_PORT:-9090}"
 HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-12}"
@@ -10,7 +10,13 @@ HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 RUNTIME_DIR="${PROJECT_DIR}/runtime"
-LOG_CAPTURE_FILE="${RUNTIME_DIR}/deploy.log"
+LOG_CAPTURE_FILE="${RUNTIME_DIR}/deploy-dev.log"
+GIT_REMOTE="${GIT_REMOTE:-origin}"
+TARGET_BRANCH="${TARGET_BRANCH:-dev}"
+APT_MIRROR_HOST="${APT_MIRROR_HOST:-mirrors.aliyun.com}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
+PUBLIC_IP="${PUBLIC_IP:-}"
+SERVER_IP=""
 
 log() {
   echo "$1"
@@ -59,21 +65,14 @@ require_env_value() {
   grep -Eq "^${key}=.+" "${ENV_FILE}" || fail ".env 缺少必要配置: ${key}"
 }
 
-require_milvus_target() {
-  local milvus_host
-  local milvus_url
-  milvus_host="$(grep -E '^MILVUS_HOST=' "${ENV_FILE}" | cut -d= -f2- || true)"
-  milvus_url="$(grep -E '^MILVUS_URL=' "${ENV_FILE}" | cut -d= -f2- || true)"
+require_git_repo() {
+  git -C "${PROJECT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "当前目录不是 git 仓库"
+  git -C "${PROJECT_DIR}" remote get-url "${GIT_REMOTE}" >/dev/null 2>&1 || fail "git remote 不存在: ${GIT_REMOTE}"
+}
 
-  if [ -n "${milvus_host}" ] && [ "${milvus_host}" != "localhost" ] && [ "${milvus_host}" != "127.0.0.1" ]; then
-    return 0
-  fi
-
-  if [ -n "${milvus_url}" ] && [[ "${milvus_url}" != *"localhost"* ]] && [[ "${milvus_url}" != *"127.0.0.1"* ]]; then
-    return 0
-  fi
-
-  fail "Milvus 地址不能使用 localhost/127.0.0.1；阿里云 ECS 容器内无法访问宿主机本地 Milvus"
+require_target_branch_exists() {
+  git -C "${PROJECT_DIR}" ls-remote --exit-code --heads "${GIT_REMOTE}" "${TARGET_BRANCH}" >/dev/null 2>&1 \
+    || fail "远端分支不存在: ${GIT_REMOTE}/${TARGET_BRANCH}"
 }
 
 require_runtime_dirs() {
@@ -115,8 +114,35 @@ wait_for_health_check() {
   return 1
 }
 
-log "[1/9] 检查项目结构和环境文件"
+resolve_server_ip() {
+  local ip
+
+  if [ -n "${PUBLIC_IP}" ]; then
+    SERVER_IP="${PUBLIC_IP}"
+    return
+  fi
+
+  ip="$(curl -fsS https://api.ipify.org 2>/dev/null || true)"
+  if [ -z "${ip}" ]; then
+    ip="$(curl -fsS https://ifconfig.me 2>/dev/null || true)"
+  fi
+  [ -n "${ip}" ] || fail "无法解析公网 IP，请先设置 PUBLIC_IP 环境变量后再部署"
+  SERVER_IP="${ip}"
+}
+
+force_sync_dev_branch() {
+  log "警告: 即将强制覆盖本地改动并同步 ${GIT_REMOTE}/${TARGET_BRANCH}"
+  cd "${PROJECT_DIR}"
+  git fetch "${GIT_REMOTE}" "${TARGET_BRANCH}"
+  git checkout "${TARGET_BRANCH}"
+  git reset --hard "${GIT_REMOTE}/${TARGET_BRANCH}"
+  git clean -fd
+}
+
+log "[1/10] 检查项目结构、git 仓库和环境文件"
 require_project_layout
+require_git_repo
+require_target_branch_exists
 require_env_file
 require_env_value "OPENROUTER_API_KEY"
 require_env_value "OPENROUTER_API_BASE"
@@ -127,24 +153,32 @@ require_env_value "MEM0_EMBEDDING_DIMS"
 require_env_value "WINDOW_SIZE"
 require_env_value "MAX_WORKERS"
 
-log "[2/9] 检查 Docker、curl 和宿主机运行目录"
+log "[2/10] 检查 Docker、curl、ss 和运行目录"
 require_docker_ready
+require_command git
 require_command curl
 require_command ss
 require_runtime_dirs
 
-log "[3/9] 清理旧容器"
+log "[3/10] 强制同步 GitHub ${GIT_REMOTE}/${TARGET_BRANCH} 分支"
+force_sync_dev_branch
+
+log "[4/10] 清理旧容器"
 if container_exists; then
   docker rm -f "${APP_NAME}" >/dev/null 2>&1 || fail "删除旧容器失败: ${APP_NAME}"
 fi
 
-log "[4/9] 检查宿主机端口 ${HOST_PORT} 是否可用"
+log "[5/10] 检查宿主机端口 ${HOST_PORT} 是否可用"
 require_port_free
 
-log "[5/9] 构建镜像"
-docker build -t "${IMAGE_NAME}" "${PROJECT_DIR}"
+log "[6/10] 使用国内镜像参数构建 Docker 镜像"
+docker build \
+  --pull \
+  --build-arg APT_MIRROR_HOST=mirrors.aliyun.com \
+  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+  -t "${IMAGE_NAME}" "${PROJECT_DIR}"
 
-log "[6/9] 启动容器"
+log "[7/10] 启动 Docker 容器"
 docker run -d \
   --name "${APP_NAME}" \
   --restart unless-stopped \
@@ -153,17 +187,19 @@ docker run -d \
   -v "${RUNTIME_DIR}:/app/runtime" \
   "${IMAGE_NAME}" >/dev/null
 
-log "[7/9] 检查容器运行状态"
+log "[8/10] 检查容器运行状态"
 require_container_running
 
-log "[8/9] 等待健康检查通过"
+log "[9/10] 等待健康检查通过"
 if ! wait_for_health_check; then
   echo "服务启动失败，打印容器日志" >&2
   print_container_logs
   exit 1
 fi
 
-log "[9/9] 输出部署结果"
+log "[10/10] 输出部署结果"
+resolve_server_ip
 log "部署成功"
-log "访问地址: http://127.0.0.1:${HOST_PORT}/"
+log "已强制同步分支: ${GIT_REMOTE}/${TARGET_BRANCH}"
+log "访问地址: http://${SERVER_IP}:${HOST_PORT}/"
 log "查看日志: docker logs -f ${APP_NAME}"

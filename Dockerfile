@@ -23,6 +23,6 @@ COPY . .
 
 RUN mkdir -p /app/data /app/runtime
 
-EXPOSE 8090
+EXPOSE 9090
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8090"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "9090"]
