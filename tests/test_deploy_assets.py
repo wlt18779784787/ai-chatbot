@@ -37,6 +37,28 @@ class DockerDeployAssetsTests(unittest.TestCase):
         self.assertIn('for attempt in $(seq 1 "${HEALTH_CHECK_RETRIES}")', script)
         self.assertIn('sleep "${HEALTH_CHECK_INTERVAL}"', script)
 
+    def test_dev_deploy_script_force_syncs_origin_dev_and_uses_domestic_build_args(self):
+        script = (BASE_DIR / "deploy_github_dev_docker_9090.sh").read_text(encoding="utf-8")
+        self.assertIn('HOST_PORT="${HOST_PORT:-9090}"', script)
+        self.assertIn('TARGET_BRANCH="${TARGET_BRANCH:-dev}"', script)
+        self.assertIn('git fetch "${GIT_REMOTE}" "${TARGET_BRANCH}"', script)
+        self.assertIn('git checkout "${TARGET_BRANCH}"', script)
+        self.assertIn('git reset --hard "${GIT_REMOTE}/${TARGET_BRANCH}"', script)
+        self.assertIn('git clean -fd', script)
+        self.assertIn('--build-arg APT_MIRROR_HOST=mirrors.aliyun.com', script)
+        self.assertIn('--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/', script)
+        self.assertIn('hostname -I', script)
+        self.assertIn('SERVER_IP=', script)
+        self.assertIn('http://${SERVER_IP}:${HOST_PORT}/', script)
+        self.assertLess(script.index('git reset --hard "${GIT_REMOTE}/${TARGET_BRANCH}"'), script.index('docker build \\'))
+
+    def test_dev_stop_script_stops_matching_container(self):
+        script = (BASE_DIR / "stop_github_dev_docker_9090.sh").read_text(encoding="utf-8")
+        self.assertIn('APP_NAME="${APP_NAME:-ai-chatbot}"', script)
+        self.assertIn('HOST_PORT="${HOST_PORT:-9090}"', script)
+        self.assertIn("docker rm -f", script)
+        self.assertIn("docker ps -a --format '{{.Names}}'", script)
+
     def test_dockerignore_excludes_env_file(self):
         dockerignore = (BASE_DIR / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn(".env", dockerignore.splitlines())
