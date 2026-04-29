@@ -1,0 +1,14 @@
+.env
+.venv/
+.idea/
+.agents/
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+history.db
+api/history.db
+cli/history.db
+data/
+runtime/

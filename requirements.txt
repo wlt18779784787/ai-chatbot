@@ -1,0 +1,7 @@
+fastapi==0.109.0
+uvicorn==0.27.0.post1
+mem0ai==2.0.1
+pymilvus==2.6.3
+requests==2.32.5
+python-multipart==0.0.9
+python-dotenv==1.0.1

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "mem0": {
+      "source": "mem0ai/mem0",
+      "sourceType": "github",
+      "computedHash": "7172263eed65f07ef281ac873ec40b8f81a207177e865198fc90cf00a7048aa3"
+    }
+  }
+}
