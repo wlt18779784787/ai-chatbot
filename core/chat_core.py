@@ -12,17 +12,12 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
-from mem0 import Memory
+from mem0 import MemoryClient
 
-from config import config, get_mem0_oss_config, get_openrouter_reasoning_config
-from core.mem0_compat import apply_mem0_milvus_dense_only_patch, apply_mem0_openrouter_reasoning_config_patch
+from config import config, get_mem0_client_config, get_openrouter_reasoning_config
 
 # 用线程池承接较慢的 IO 操作，避免把记忆保存阻塞在主请求路径里。
 executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
-
-# 启动时先打补丁，关闭 mem0 在 Milvus 上的 BM25 / sparse 索引逻辑。
-apply_mem0_milvus_dense_only_patch()
-apply_mem0_openrouter_reasoning_config_patch()
 
 INITIAL_MEMORY_BATCH_ROUNDS = 5
 MEMORY_BATCH_ROUNDS = 5
@@ -95,7 +90,7 @@ class ChatCore:
         self.sessions: Dict[SessionScope, UserSession] = {}
         self.sessions_lock = threading.Lock()
         self.executor = executor
-        self.memory_client: Optional[Memory] = Memory.from_config(get_mem0_oss_config())
+        self.memory_client: Optional[MemoryClient] = MemoryClient(**get_mem0_client_config())
 
     def get_or_create_session(self, scope: SessionScope) -> UserSession:
         """按作用域取会话，没有就新建一个。"""
@@ -103,6 +98,10 @@ class ChatCore:
             if scope not in self.sessions:
                 self.sessions[scope] = UserSession(scope=scope)
             return self.sessions[scope]
+
+    def build_memory_scope_id(self, scope: SessionScope) -> str:
+        """Build a Mem0-compatible composite scope ID for long-term memory isolation."""
+        return f"{scope.user_id}::{scope.agent_id}"
 
     def _is_follow_up_query(self, user_input: str) -> bool:
         """判断当前输入是否属于依赖上一轮语境的续问。"""
@@ -158,10 +157,7 @@ class ChatCore:
     def search_memories(self, query: str, scope: SessionScope, top_k: int = 7) -> List[dict]:
         """从 mem0 检索相关长期记忆，使用 user_id + agent_id 过滤。"""
         try:
-            filters = {
-                "user_id": scope.user_id,
-                "agent_id": scope.agent_id,
-            }
+            filters = {"user_id": self.build_memory_scope_id(scope)}
             result = self.memory_client.search(query, filters=filters, top_k=top_k)
             return result.get("results", [])
         except Exception as exc:
@@ -173,8 +169,11 @@ class ChatCore:
 
         self.memory_client.add(
             messages,
-            user_id=scope.user_id,
-            agent_id=scope.agent_id,
+            user_id=self.build_memory_scope_id(scope),
+            metadata={
+                "source_user_id": scope.user_id,
+                "source_agent_id": scope.agent_id,
+            },
         )
 
     def _persist_memory_batch(self, messages: List[dict], scope: SessionScope, rounds_count: int):
@@ -196,7 +195,7 @@ class ChatCore:
             "model": config.MODEL_NAME,
             "messages": messages,
         }
-        reasoning = get_openrouter_reasoning_config()
+        reasoning = get_openrouter_reasoning_config(config.REASONING_ENABLED)
         if reasoning is not None:
             request_payload["reasoning"] = reasoning
 
@@ -211,7 +210,13 @@ class ChatCore:
         )
         model_call_duration = time.perf_counter() - model_call_started
         print(f"模型调用耗时 | model={config.MODEL_NAME} | duration={model_call_duration:.2f}s")
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            error_body = (response.text or "").strip()
+            if error_body:
+                raise requests.HTTPError(f"{exc} | response={error_body}") from exc
+            raise
         return response.json()["choices"][0]["message"]["content"]
 
     def _get_current_time_text(self) -> str:

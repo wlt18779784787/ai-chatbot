@@ -23,9 +23,10 @@ class Config:
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_API_BASE: str = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
     OPENROUTER_CHAT_URL: str = f"{OPENROUTER_API_BASE}/chat/completions"
+    MEM0_API_KEY: str = os.getenv("MEM0_API_KEY", "")
 
     # === Models ===
-    MODEL_NAME: str = os.getenv("MODEL_NAME", "moonshot/kimi2.5")
+    MODEL_NAME: str = os.getenv("MODEL_NAME", "moonshotai/kimi-k2")
     REASONING_ENABLED: bool = _get_bool_env("REASONING_ENABLED", False)
     MEM0_EMBED_MODEL: str = os.getenv("MEM0_EMBED_MODEL", "qwen/qwen3-embedding-4b")
     MEM0_EMBEDDING_DIMS: int = int(os.getenv("MEM0_EMBEDDING_DIMS", "2560"))
@@ -61,47 +62,17 @@ def _build_milvus_token():
     return None
 
 
-def get_openrouter_reasoning_config():
-    reasoning_enabled = getattr(globals().get("config"), "REASONING_ENABLED", Config.REASONING_ENABLED)
+def get_openrouter_reasoning_config(reasoning_enabled: bool | None = None):
+    if reasoning_enabled is None:
+        reasoning_enabled = _get_bool_env("REASONING_ENABLED", Config.REASONING_ENABLED)
     if reasoning_enabled:
         return None
     return {"effort": "none", "exclude": True}
 
 
-def get_mem0_oss_config() -> dict:
-    """Build Mem0 OSS configuration for OpenRouter + Milvus."""
-    return {
-        "reasoning_enabled": Config.REASONING_ENABLED,
-        "llm": {
-            "provider": "openai",
-            "config": {
-                "model": Config.MODEL_NAME,
-                "api_key": Config.OPENROUTER_API_KEY,
-                "openai_base_url": Config.OPENROUTER_API_BASE,
-            },
-        },
-        "embedder": {
-            "provider": "openai",
-            "config": {
-                "model": Config.MEM0_EMBED_MODEL,
-                "api_key": Config.OPENROUTER_API_KEY,
-                "openai_base_url": Config.OPENROUTER_API_BASE,
-                "embedding_dims": Config.MEM0_EMBEDDING_DIMS,
-            },
-        },
-        "vector_store": {
-            "provider": "milvus",
-            "config": {
-                "url": _build_milvus_url(),
-                "token": _build_milvus_token(),
-                "db_name": Config.MILVUS_DB_NAME,
-                "collection_name": Config.MILVUS_COLLECTION_NAME,
-                "embedding_model_dims": Config.MEM0_EMBEDDING_DIMS,
-                "metric_type": Config.MILVUS_METRIC_TYPE,
-            },
-        },
-        "history_db_path": Config.MEM0_HISTORY_DB_PATH,
-    }
+def get_mem0_client_config() -> dict:
+    """Build Mem0 platform client configuration."""
+    return {"api_key": os.getenv("MEM0_API_KEY", Config.MEM0_API_KEY)}
 
 
 config = Config()

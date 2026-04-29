@@ -9,7 +9,6 @@ HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-12}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
-DATA_DIR="${PROJECT_DIR}/data"
 RUNTIME_DIR="${PROJECT_DIR}/runtime"
 LOG_CAPTURE_FILE="${RUNTIME_DIR}/deploy.log"
 
@@ -78,8 +77,7 @@ require_milvus_target() {
 }
 
 require_runtime_dirs() {
-  mkdir -p "${DATA_DIR}" "${RUNTIME_DIR}"
-  [ -w "${DATA_DIR}" ] || fail "目录不可写: ${DATA_DIR}"
+  mkdir -p "${RUNTIME_DIR}"
   [ -w "${RUNTIME_DIR}" ] || fail "目录不可写: ${RUNTIME_DIR}"
 }
 
@@ -122,12 +120,12 @@ require_project_layout
 require_env_file
 require_env_value "OPENROUTER_API_KEY"
 require_env_value "OPENROUTER_API_BASE"
+require_env_value "MEM0_API_KEY"
 require_env_value "MODEL_NAME"
 require_env_value "MEM0_EMBED_MODEL"
 require_env_value "MEM0_EMBEDDING_DIMS"
 require_env_value "WINDOW_SIZE"
 require_env_value "MAX_WORKERS"
-require_milvus_target
 
 log "[2/9] 检查 Docker、curl 和宿主机运行目录"
 require_docker_ready
@@ -151,9 +149,7 @@ docker run -d \
   --name "${APP_NAME}" \
   --restart unless-stopped \
   --env-file "${ENV_FILE}" \
-  -e MEM0_HISTORY_DB_PATH=/app/data/history.db \
   -p "${HOST_PORT}:${CONTAINER_PORT}" \
-  -v "${DATA_DIR}:/app/data" \
   -v "${RUNTIME_DIR}:/app/runtime" \
   "${IMAGE_NAME}" >/dev/null
 

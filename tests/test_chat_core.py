@@ -16,13 +16,14 @@ class FakeMemoryStore:
         self.search_calls.append((query, filters, top_k))
         return {"results": []}
 
-    def add(self, messages, user_id=None, agent_id=None, run_id=None):
+    def add(self, messages, user_id=None, agent_id=None, run_id=None, metadata=None):
         self.add_calls.append(
             {
                 "messages": messages,
                 "user_id": user_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
+                "metadata": metadata,
             }
         )
         return {"results": []}
@@ -31,10 +32,12 @@ class FakeMemoryStore:
 class ChatCoreMem0IntegrationTests(unittest.TestCase):
     def _load_chat_core(self, fake_memory):
         fake_mem0 = types.ModuleType("mem0")
-        fake_mem0.Memory = type("FakeMemory", (), {"from_config": staticmethod(lambda config: fake_memory)})
+        fake_mem0.MemoryClient = type("FakeMemoryClient", (), {"__new__": staticmethod(lambda cls, **kwargs: fake_memory)})
 
         sys.modules.pop("core.chat_core", None)
         sys.modules.pop("core", None)
+        sys.modules.pop("config", None)
+        sys.modules.pop("config.settings", None)
 
         with patch.dict(sys.modules, {"mem0": fake_mem0}):
             import core.chat_core as chat_core_module
@@ -42,28 +45,80 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             importlib.reload(chat_core_module)
             return chat_core_module, chat_core_module.ChatCore()
 
-    def test_chat_core_uses_memory_from_config(self):
+    def test_chat_core_uses_memory_client_from_config(self):
         fake_memory = FakeMemoryStore()
         captured = {}
 
-        def fake_from_config(config):
-            captured["config"] = config
-            return fake_memory
+        class FakeMemoryClient:
+            def __new__(cls, **kwargs):
+                captured["config"] = kwargs
+                return fake_memory
 
         fake_mem0 = types.ModuleType("mem0")
-        fake_mem0.Memory = type("FakeMemory", (), {"from_config": staticmethod(fake_from_config)})
+        fake_mem0.MemoryClient = FakeMemoryClient
 
         sys.modules.pop("core.chat_core", None)
         sys.modules.pop("core", None)
+        sys.modules.pop("config", None)
+        sys.modules.pop("config.settings", None)
 
-        with patch.dict(sys.modules, {"mem0": fake_mem0}):
+        with patch.dict(sys.modules, {"mem0": fake_mem0}), patch.dict("os.environ", {"MEM0_API_KEY": "m0-test-key"}, clear=False):
             import core.chat_core as chat_core_module
 
             importlib.reload(chat_core_module)
             chat_core = chat_core_module.ChatCore()
 
         self.assertIs(chat_core.memory_client, fake_memory)
-        self.assertEqual(captured["config"]["vector_store"]["provider"], "milvus")
+        self.assertEqual(captured["config"], {"api_key": "m0-test-key"})
+
+    def test_build_memory_scope_id_is_stable_per_user_and_agent(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+
+        scope_a = chat_core_module.SessionScope("alice", "agent-1")
+        scope_b = chat_core_module.SessionScope("alice", "agent-2")
+
+        self.assertEqual(chat_core.build_memory_scope_id(scope_a), "alice::agent-1")
+        self.assertEqual(chat_core.build_memory_scope_id(scope_a), "alice::agent-1")
+        self.assertEqual(chat_core.build_memory_scope_id(scope_b), "alice::agent-2")
+
+    def test_search_memories_uses_composite_scope_filter(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+
+        chat_core.search_memories("hello", scope)
+
+        self.assertEqual(len(fake_memory.search_calls), 1)
+        _, filters, _ = fake_memory.search_calls[0]
+        self.assertEqual(
+            filters,
+            {
+                "user_id": "alice::agent-1",
+            },
+        )
+
+    def test_save_to_memory_passes_composite_scope_id_to_platform_client(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        messages = [{"role": "user", "content": "hello"}]
+
+        chat_core.save_to_memory(messages, scope)
+
+        self.assertEqual(len(fake_memory.add_calls), 1)
+        add_call = fake_memory.add_calls[0]
+        self.assertEqual(add_call["messages"], messages)
+        self.assertEqual(add_call["user_id"], "alice::agent-1")
+        self.assertIsNone(add_call["agent_id"])
+        self.assertIsNone(add_call["run_id"])
+        self.assertEqual(
+            add_call["metadata"],
+            {
+                "source_user_id": "alice",
+                "source_agent_id": "agent-1",
+            },
+        )
 
     def test_get_or_create_session_uses_full_scope(self):
         fake_memory = FakeMemoryStore()
@@ -76,23 +131,6 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         session_b = chat_core.get_or_create_session(scope_b)
 
         self.assertIsNot(session_a, session_b)
-
-    def test_search_memories_uses_flat_scope_filters(self):
-        fake_memory = FakeMemoryStore()
-        chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        scope = chat_core_module.SessionScope("alice", "agent-1")
-
-        chat_core.search_memories("hello", scope)
-
-        self.assertEqual(len(fake_memory.search_calls), 1)
-        _, filters, _ = fake_memory.search_calls[0]
-        self.assertEqual(
-            filters,
-            {
-                "user_id": "alice",
-                "agent_id": "agent-1",
-            },
-        )
 
     def test_follow_up_query_is_rewritten_with_last_round_context(self):
         fake_memory = FakeMemoryStore()
@@ -184,21 +222,6 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(session.memory_round_buffer[0][0]["content"], "u6")
         self.assertEqual(session.memory_flush_count, 2)
 
-    def test_persist_memory_batch_passes_scope_ids_to_mem0(self):
-        fake_memory = FakeMemoryStore()
-        chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        scope = chat_core_module.SessionScope("alice", "agent-1")
-        messages = [{"role": "user", "content": "hello"}]
-
-        chat_core._persist_memory_batch(messages, scope, 10)
-
-        self.assertEqual(len(fake_memory.add_calls), 1)
-        add_call = fake_memory.add_calls[0]
-        self.assertEqual(add_call["messages"], messages)
-        self.assertEqual(add_call["user_id"], "alice")
-        self.assertEqual(add_call["agent_id"], "agent-1")
-        self.assertIsNone(add_call["run_id"])
-
     def test_chat_prints_prompt_messages_before_model_call(self):
         fake_memory = FakeMemoryStore()
         _, chat_core = self._load_chat_core(fake_memory)
@@ -229,7 +252,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with (
             patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
-            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "MODEL_NAME", "moonshotai/kimi-k2"),
             patch.object(chat_core_module.config, "REASONING_ENABLED", False),
         ):
             content = chat_core.call_model([{"role": "user", "content": "hello"}])
@@ -237,7 +260,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(content, "ok")
         self.assertEqual(post_mock.call_count, 1)
         _, kwargs = post_mock.call_args
-        self.assertEqual(kwargs["json"]["model"], "moonshot/kimi2.5")
+        self.assertEqual(kwargs["json"]["model"], "moonshotai/kimi-k2")
         self.assertEqual(kwargs["json"]["reasoning"], {"effort": "none", "exclude": True})
 
     def test_call_model_omits_reasoning_when_switch_on(self):
@@ -254,7 +277,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with (
             patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
-            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "MODEL_NAME", "moonshotai/kimi-k2"),
             patch.object(chat_core_module.config, "REASONING_ENABLED", True),
         ):
             content = chat_core.call_model([{"role": "user", "content": "hello"}])
@@ -262,8 +285,29 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(content, "ok")
         self.assertEqual(post_mock.call_count, 1)
         _, kwargs = post_mock.call_args
-        self.assertEqual(kwargs["json"]["model"], "moonshot/kimi2.5")
+        self.assertEqual(kwargs["json"]["model"], "moonshotai/kimi-k2")
         self.assertNotIn("reasoning", kwargs["json"])
+
+    def test_call_model_includes_openrouter_error_body_on_http_failure(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+
+        class ResponseStub:
+            status_code = 400
+            text = '{"error":{"message":"moonshot/kimi2.5 is not a valid model ID","code":400}}'
+
+            def raise_for_status(self):
+                raise chat_core_module.requests.HTTPError("400 Client Error: Bad Request for url")
+
+        with (
+            patch.object(chat_core_module.requests, "post", return_value=ResponseStub()),
+            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "REASONING_ENABLED", False),
+        ):
+            with self.assertRaises(chat_core_module.requests.HTTPError) as ctx:
+                chat_core.call_model([{"role": "user", "content": "hello"}])
+
+        self.assertIn("moonshot/kimi2.5 is not a valid model ID", str(ctx.exception))
 
     def test_chat_duration_covers_full_request_not_just_model_call(self):
         fake_memory = FakeMemoryStore()
