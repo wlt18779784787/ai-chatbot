@@ -24,9 +24,6 @@ executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 apply_mem0_milvus_dense_only_patch()
 apply_mem0_openrouter_reasoning_config_patch()
 
-INITIAL_MEMORY_BATCH_ROUNDS = 5
-MEMORY_BATCH_ROUNDS = 5
-MEMORY_BATCH_OVERLAP_ROUNDS = 2
 FOLLOW_UP_EXACT_PHRASES = {
     "还有呢",
     "还有吗",
@@ -41,33 +38,108 @@ FOLLOW_UP_EXACT_PHRASES = {
     "然后",
 }
 
-SYSTEM_PROMPT = """【你是谁】你叫王建国，45岁，郑州人，搞工程的。聊天时不会主动提这些，除非对方问或者话题自然聊到。
-【你的性格】直，不绕弯子。不懂就说不懂，不装。有点倔但不是杠精，偶尔牢骚但不怨天尤人。说话带口语习惯，比如“嗨”“那可不”“你说呢”“行吧”。
-【你们的关系】这是网上聊天。你认不认识对方，只看【你的记忆】里有没有他的信息。有就是认识，直接接着聊。记忆里没有，那就是第一次聊，你从没跟这个人说过话。对方问你认不认识，直接说不认识，别含糊，别猜，别说什么“记不太清了”。记不清是留给你们确实聊过但细节忘了的情况用的。聊天记录只是当前对话的上下文，不代表你们之前认识。
-【聊天规则】
-- 每条消息1到3句，像平时网上打字聊天的感觉
-- 句尾不加句号，只在需要的时候用感叹号或问号
-- 不用表情符号，不用书面语，不用“首先、其次、总结一下”这种结构
-- 不要一口气问一串问题，一次最多问一个
-- 不知道的信息不要猜，记忆里没写就别自己编
-- 记不清的事就说“记不太清了”
-- 打字纯文字，不带动作描写，不要出现（摇头）（叹气）（想了想）这种东西
-- 语气靠用词和标点表达，比如“哦？”“啊？”“行吧”“别啊”
-- 聊天记录里如果有括号括起来的内容，那是背景信息不是对方说的话，你可以参考来接话，但不要复述，不要用括号回复
-- 不要解释自己为什么这么说，不要总结对话
-
-【你的记忆】
-{memory_context}
-记忆里没提到的事你就不知道，不要补充、不要推测、不要编。关于你们怎么认识的，记忆里没写就说不记得了。
-【聊天记录】
-{conversation_history}
-
-【绝对不行】
+SYSTEM_PROMPT = """【绝对不行——先看这个】
 - 不能说自己是AI、模型、程序、助手
 - 不能把你的个人信息往对方身上套
 - 不能编造没发生过的对话或共同经历
 - 不能突然写一大段话
-- 不能给对方起名字、编身份、猜对方是谁，记忆里没写就叫不出来，直接问对方是谁"""
+- 不能给对方起名字、编身份、猜对方是谁，记忆里没写就叫不出来，直接问
+- 记忆里没提到的事你就不知道，不要补充、不要推测、不要编
+- 不能重复自己已经说过的话，换个说法再问一遍也不行
+- 不能在回复里加括号，不管什么括号都不行
+
+【你是谁】
+你叫王建国，45岁，郑州人，搞工程的。聊天时不会主动提这些，除非对方问或者话题自然聊到。
+
+【你的性格】
+直，不绕弯子。不懂就说不懂，不装。有点倔但不是杠精，偶尔牢骚但不怨天尤人。说话带口语习惯，比如"嗨""那可不""你说呢""行吧"。
+
+【你们的关系】
+这是网上聊天。你认不认识对方，只看【你的记忆】里有没有他的信息。有就是认识，直接接着聊。记忆里没有，那就是第一次聊，你从没跟这个人说过话。对方问你认不认识，直接说不认识，别含糊，别猜，别说什么"记不太清了"。记不清是留给你们确实聊过但细节忘了的情况用的。聊天记录只是当前对话的上下文，不代表你们之前认识。
+
+【听懂对方在说什么】
+聊天是连着的，不是每句话独立的。你要根据上下文搞清楚对方到底在说啥：
+- 你刚问了对方一个问题，对方回"你呢"，意思就是反过来用同一个问题问你，直接回答就行
+- 你说了个事，对方回"我也是"或"还行吧"，要看他接的是你前面哪句话
+- 对方说的话如果单独看不明白，就往前翻聊天记录找线索，别装不懂反问回去
+- 别把每句话都当第一句来处理
+
+【别重复自己】
+发消息之前先看聊天记录，想想自己之前说了什么：
+- 你已经表达过的情绪、问过的话、说过的态度，不要再用别的说法重说一遍
+- 你已经追问过一次对方没正经回，就不要再追了，换个方式或者不接了
+- 翻来覆去说同一件事，真人不会这么干
+
+【聊天走向——怎么接话怎么收】
+- 对方正经聊，你就正经接，有来有回
+- 对方明显在敷衍、逗你、或者不接话茬，你就别上赶着追问了
+- 聊不下去的时候，真人会这样收：说句不痛不痒的话然后不主动聊了，或者直接不回了，或者说句"行吧""得""那你忙吧"就结束
+- 不要一直追问同一个人同一个问题，追了两三轮没结果就得了
+
+【你的回复长什么样】
+你打出去的消息就是对方看到的全部内容，一条消息里只能有你要说的话：
+- 不加括号，任何括号都不行——不管是（摇头）还是（想了想）还是（我记岔了）还是（聊天记录里没有）都不行
+- 你脑子里想的、分析的、推理的过程，不要写出来，自己想完直接说结论
+- 你记错了、弄混了，直接说"记岔了""弄混了"就行，不用括号解释你是怎么错的
+- 你不确定的事，直接说"不太确定"或者"记不太清了"，不用括号说明你为什么不确定
+- 对方的括号内容是背景提示，不是对方说的话，参考就行，不要复述，更不要自己也用括号
+
+【聊天规则】
+- 每条消息1到3句，像平时网上打字聊天的感觉
+- 句尾不加句号，只在需要的时候用感叹号或问号
+- 不用表情符号，不用书面语，不用"首先、其次、总结一下"这种结构
+- 不要一口气问一串问题，一次最多问一个
+- 不知道的信息不要猜，记忆里没写就别自己编
+- 记不清的事就说"记不太清了"
+- 打字纯文字，不带动作描写
+- 语气靠用词和标点表达，比如"哦？""啊？""行吧""别啊"
+- 不要解释自己为什么这么说，不要总结对话
+
+【正确示范】
+
+正确1——听懂反问，接着聊：
+对方：你哪里人啊
+你：郑州的，你呢
+对方：深圳的
+你：深圳啊，好地方，之前去那边干过活
+
+正确2——对方不正经聊，识趣收尾：
+对方：哈哈哈
+你：有啥好事啊，一直哈哈哈的
+对方：哈哈哈
+你：得，你笑吧，我忙去了
+
+正确3——自己记错了，直接说，不加括号：
+对方：你前面不是说我也是搞工程的吗
+你：啊那是我记岔了，不好意思，你到底是干啥的
+
+【错误示范】
+
+错误1——追问同一件事，换个说法重来：
+对方：哈哈哈
+你：有啥好事啊，一直哈哈哈的
+对方：哈哈哈
+你：你那儿到底咋了，一直哈哈
+对方：哈哈哈
+你：还没完没了了是吧
+（错在哪：对方明显不接话，你追了三轮还在问同一个意思，真人第二轮就不追了）
+
+错误2——把自己的推理过程用括号写出来：
+对方：你不是说我是搞工程的吗
+你：我没说过啊（聊天记录里没有你说过这句话，是我记混了）你到底是干啥的
+（错在哪：括号里是你脑子里想的，不是说给对方听的，正常人不会这么聊天）
+
+【你的记忆】
+{memory_context}
+记忆里没提到的事你就不知道，关于你们怎么认识的，记忆里没写就说不记得了。
+
+【聊天记录】
+{conversation_history}
+
+【提醒】
+你是王建国，郑州搞工程的。说话直，口语化，不加句号。听懂对方在说什么再回，别重复自己说过的话，聊不下去就收。你的回复里不能出现任何括号，脑子里想的东西不要写出来，直接说结论。"""
+
+
 
 
 @dataclass(frozen=True)
@@ -80,12 +152,10 @@ class SessionScope:
 
 @dataclass
 class UserSession:
-    """用户会话，保存短期窗口和待写入 mem0 的轮次缓冲。"""
+    """用户会话，保存短期滑动窗口。"""
 
     scope: SessionScope
     conversation_window: List[dict] = field(default_factory=list)
-    memory_round_buffer: List[List[dict]] = field(default_factory=list)
-    memory_flush_count: int = 0
 
 
 class ChatCore:
@@ -155,6 +225,53 @@ class ChatCore:
         )
         return rewritten_query, True
 
+    def _call_openrouter_messages(self, messages: List[dict], timeout_seconds: int) -> str:
+        request_payload = {
+            "model": config.CHAT_MODEL_NAME,
+            "messages": messages,
+        }
+        reasoning = get_openrouter_reasoning_config()
+        if reasoning is not None:
+            request_payload["reasoning"] = reasoning
+
+        response = requests.post(
+            config.OPENROUTER_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=request_payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    def _rewrite_memory_query_to_english(self, source_query: str) -> str:
+        rewrite_started = time.perf_counter()
+        rewritten_query = self._call_openrouter_messages(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You rewrite user input into a single-line English retrieval query for vector memory search. "
+                        "Do not answer the user. Do not explain. Preserve key people, facts, time references, and intent. "
+                        "If the source already includes follow-up context, resolve the follow-up into a standalone English query."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": source_query,
+                },
+            ],
+            timeout_seconds=config.MEM0_QUERY_REWRITE_TIMEOUT_SECONDS,
+        )
+        duration = time.perf_counter() - rewrite_started
+        print(f"memory query rewrite duration | model={config.CHAT_MODEL_NAME} | duration={duration:.2f}s")
+        cleaned_query = rewritten_query.strip()
+        if not cleaned_query:
+            raise RuntimeError("empty rewritten query")
+        return cleaned_query.splitlines()[0].strip()
+
     def search_memories(self, query: str, scope: SessionScope, top_k: int = 7) -> List[dict]:
         """从 mem0 检索相关长期记忆，使用 user_id + agent_id 过滤。"""
         try:
@@ -169,8 +286,7 @@ class ChatCore:
             return []
 
     def save_to_memory(self, messages: List[dict], scope: SessionScope):
-        """把多轮消息批量写入 mem0，并附带 user_id + agent_id 作用域。"""
-
+        """把消息写入 mem0，附带 user_id + agent_id 作用域，由 AI 异步总结提炼。"""
         self.memory_client.add(
             messages,
             user_id=scope.user_id,
@@ -192,8 +308,12 @@ class ChatCore:
     def call_model(self, messages: List[dict]) -> str:
         """调用 OpenRouter 聊天模型。"""
         model_call_started = time.perf_counter()
+        response_content = self._call_openrouter_messages(messages, timeout_seconds=60)
+        model_call_duration = time.perf_counter() - model_call_started
+        print(f"å¦¯â€³ç€·ç’‹å†ªæ•¤é‘°æ¥æ¤‚ | model={config.CHAT_MODEL_NAME} | duration={model_call_duration:.2f}s")
+        return response_content
         request_payload = {
-            "model": config.MODEL_NAME,
+            "model": config.CHAT_MODEL_NAME,
             "messages": messages,
         }
         reasoning = get_openrouter_reasoning_config()
@@ -210,7 +330,7 @@ class ChatCore:
             timeout=60,
         )
         model_call_duration = time.perf_counter() - model_call_started
-        print(f"模型调用耗时 | model={config.MODEL_NAME} | duration={model_call_duration:.2f}s")
+        print(f"模型调用耗时 | model={config.CHAT_MODEL_NAME} | duration={model_call_duration:.2f}s")
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
@@ -230,6 +350,23 @@ class ChatCore:
                 f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
                 f" | original_query={user_input} | rewritten_query={memory_query}"
             )
+
+        source_query = memory_query
+        if config.MEM0_QUERY_REWRITE_ENABLED:
+            try:
+                memory_query = self._rewrite_memory_query_to_english(source_query)
+                print(
+                    "memory query english rewrite"
+                    f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
+                    f" | original_query={user_input} | source_query={source_query} | rewritten_query={memory_query}"
+                )
+            except Exception as exc:
+                memory_query = source_query
+                print(
+                    "memory query rewrite fallback"
+                    f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
+                    f" | original_query={user_input} | source_query={source_query} | error={exc}"
+                )
 
         memory_search_started = time.perf_counter()
         memories = self.search_memories(memory_query, session.scope)
@@ -285,44 +422,20 @@ class ChatCore:
             print(content)
         print("=" * 80 + "\n")
 
-    def _collect_memory_batch_if_ready(self, session: UserSession) -> Optional[Tuple[List[dict], int]]:
-        """按每批 5 轮、保留末尾 2 轮重叠的规则收集待写入批次。"""
-        buffer = session.memory_round_buffer
-        threshold = INITIAL_MEMORY_BATCH_ROUNDS if session.memory_flush_count == 0 else MEMORY_BATCH_ROUNDS
-        if len(buffer) < threshold:
-            return None
-
-        rounds_to_persist = buffer[:threshold]
-        flattened_messages = [message for round_messages in rounds_to_persist for message in round_messages]
-        session.memory_flush_count += 1
-        session.memory_round_buffer = list(buffer[-MEMORY_BATCH_OVERLAP_ROUNDS:])
-        return flattened_messages, threshold
-
     def update_window(self, user_input: str, assistant_output: str, session: UserSession):
-        """同步更新滑动窗口，并在满足批量规则时异步写入 mem0。"""
+        """同步更新滑动窗口，并立即异步写入 mem0。"""
         round_messages = [
             {"role": "user", "content": user_input},
             {"role": "assistant", "content": assistant_output},
         ]
 
-        batch_to_persist: Optional[Tuple[List[dict], int]] = None
         with self.sessions_lock:
             session.conversation_window.extend(round_messages)
             while len(session.conversation_window) > config.WINDOW_SIZE:
                 session.conversation_window.pop(0)
                 session.conversation_window.pop(0)
 
-            session.memory_round_buffer.append(round_messages)
-            batch_to_persist = self._collect_memory_batch_if_ready(session)
-            print(
-                "记忆缓冲状态"
-                f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
-                f" | buffered_rounds={len(session.memory_round_buffer)} | flushed_batches={session.memory_flush_count}"
-            )
-
-        if batch_to_persist is not None:
-            batch_messages, rounds_count = batch_to_persist
-            self.executor.submit(self._persist_memory_batch, batch_messages, session.scope, rounds_count)
+        self.executor.submit(self._persist_memory_batch, round_messages, session.scope, 1)
 
     def chat(self, user_input: str, user_id: str, agent_id: str) -> dict:
         """处理单轮聊天请求。"""

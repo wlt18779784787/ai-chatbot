@@ -26,9 +26,13 @@ class Config:
 
     # === Models ===
     MODEL_NAME: str = os.getenv("MODEL_NAME", "moonshot/kimi2.5")
+    CHAT_MODEL_NAME: str = os.getenv("CHAT_MODEL_NAME", MODEL_NAME)
+    MEM0_LLM_MODEL_NAME: str = os.getenv("MEM0_LLM_MODEL_NAME", MODEL_NAME)
     REASONING_ENABLED: bool = _get_bool_env("REASONING_ENABLED", False)
-    MEM0_EMBED_MODEL: str = os.getenv("MEM0_EMBED_MODEL", "qwen/qwen3-embedding-4b")
-    MEM0_EMBEDDING_DIMS: int = int(os.getenv("MEM0_EMBEDDING_DIMS", "2560"))
+    MEM0_QUERY_REWRITE_ENABLED: bool = _get_bool_env("MEM0_QUERY_REWRITE_ENABLED", True)
+    MEM0_QUERY_REWRITE_TIMEOUT_SECONDS: int = int(os.getenv("MEM0_QUERY_REWRITE_TIMEOUT_SECONDS", "15"))
+    MEM0_EMBED_MODEL: str = os.getenv("MEM0_EMBED_MODEL", "qwen/qwen3-embedding-0.6b")
+    MEM0_EMBEDDING_DIMS: int = int(os.getenv("MEM0_EMBEDDING_DIMS", "768"))
 
     # === Mem0 OSS / Milvus ===
     MILVUS_HOST: str = os.getenv("MILVUS_HOST", "")
@@ -38,7 +42,7 @@ class Config:
     MILVUS_URL: str = os.getenv("MILVUS_URL", "http://localhost:19530")
     MILVUS_TOKEN: str = os.getenv("MILVUS_TOKEN", "")
     MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME", "")
-    MILVUS_COLLECTION_NAME: str = os.getenv("MILVUS_COLLECTION_NAME", "mem0_qwen4b")
+    MILVUS_COLLECTION_NAME: str = os.getenv("MILVUS_COLLECTION_NAME", "mem0_qwen0_6b_768")
     MILVUS_METRIC_TYPE: str = os.getenv("MILVUS_METRIC_TYPE", "IP")
     MEM0_HISTORY_DB_PATH: str = os.getenv("MEM0_HISTORY_DB_PATH", str(BASE_DIR / "history.db"))
 
@@ -70,12 +74,23 @@ def get_openrouter_reasoning_config():
 
 def get_mem0_oss_config() -> dict:
     """Build Mem0 OSS configuration for OpenRouter + Milvus."""
+    vector_store_config = {
+        "url": _build_milvus_url(),
+        "db_name": Config.MILVUS_DB_NAME,
+        "collection_name": Config.MILVUS_COLLECTION_NAME,
+        "embedding_model_dims": Config.MEM0_EMBEDDING_DIMS,
+        "metric_type": Config.MILVUS_METRIC_TYPE,
+    }
+    milvus_token = _build_milvus_token()
+    if milvus_token is not None:
+        vector_store_config["token"] = milvus_token
+
     return {
         "reasoning_enabled": Config.REASONING_ENABLED,
         "llm": {
             "provider": "openai",
             "config": {
-                "model": Config.MODEL_NAME,
+                "model": Config.MEM0_LLM_MODEL_NAME,
                 "api_key": Config.OPENROUTER_API_KEY,
                 "openai_base_url": Config.OPENROUTER_API_BASE,
             },
@@ -91,14 +106,7 @@ def get_mem0_oss_config() -> dict:
         },
         "vector_store": {
             "provider": "milvus",
-            "config": {
-                "url": _build_milvus_url(),
-                "token": _build_milvus_token(),
-                "db_name": Config.MILVUS_DB_NAME,
-                "collection_name": Config.MILVUS_COLLECTION_NAME,
-                "embedding_model_dims": Config.MEM0_EMBEDDING_DIMS,
-                "metric_type": Config.MILVUS_METRIC_TYPE,
-            },
+            "config": vector_store_config,
         },
         "history_db_path": Config.MEM0_HISTORY_DB_PATH,
     }

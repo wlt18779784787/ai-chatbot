@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="${APP_NAME:-ai-chatbot}"
-IMAGE_NAME="${IMAGE_NAME:-ai-chatbot:latest}"
-HOST_PORT="${HOST_PORT:-8090}"
+APP_NAME="${APP_NAME:-ai-chatbot-v2}"
+IMAGE_NAME="${IMAGE_NAME:-ai-chatbot-v2:latest}"
+HOST_PORT="${HOST_PORT:-8091}"
 CONTAINER_PORT="${CONTAINER_PORT:-8090}"
 HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-12}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-5}"

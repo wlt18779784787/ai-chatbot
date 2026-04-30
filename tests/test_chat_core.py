@@ -16,13 +16,14 @@ class FakeMemoryStore:
         self.search_calls.append((query, filters, top_k))
         return {"results": []}
 
-    def add(self, messages, user_id=None, agent_id=None, run_id=None):
+    def add(self, messages, user_id=None, agent_id=None, run_id=None, infer=None):
         self.add_calls.append(
             {
                 "messages": messages,
                 "user_id": user_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
+                "infer": infer,
             }
         )
         return {"results": []}
@@ -100,20 +101,16 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
         session.conversation_window = [
-            {"role": "user", "content": "你记得我喜欢喝什么吗"},
-            {"role": "assistant", "content": "你之前提过喜欢无糖可乐"},
+            {"role": "user", "content": "你平时做什么工作"},
+            {"role": "assistant", "content": "我平时做工程相关的活"},
         ]
 
-        output = io.StringIO()
-        with redirect_stdout(output):
-            chat_core._build_messages_with_timings("还有呢", session)
+        source_query, was_expanded = chat_core._build_memory_query("还有呢", session)
 
-        self.assertEqual(len(fake_memory.search_calls), 1)
-        query, _, _ = fake_memory.search_calls[0]
-        self.assertIn("上一轮用户问题：你记得我喜欢喝什么吗", query)
-        self.assertIn("上一轮助手回复：你之前提过喜欢无糖可乐", query)
-        self.assertIn("当前用户追问：还有呢", query)
-        self.assertIn("记忆检索续问改写", output.getvalue())
+        self.assertTrue(was_expanded)
+        self.assertIn("你平时做什么工作", source_query)
+        self.assertIn("我平时做工程相关的活", source_query)
+        self.assertIn("还有呢", source_query)
 
     def test_follow_up_query_without_context_falls_back_to_original_input(self):
         fake_memory = FakeMemoryStore()
@@ -121,68 +118,87 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
 
-        chat_core._build_messages_with_timings("还有呢", session)
+        source_query, was_expanded = chat_core._build_memory_query("还有呢", session)
+
+        self.assertFalse(was_expanded)
+        self.assertEqual(source_query, "还有呢")
+
+    def test_build_messages_uses_english_rewrite_before_memory_search_when_enabled(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", True), patch.object(
+            chat_core,
+            "_rewrite_memory_query_to_english",
+            return_value="english retrieval query",
+        ) as rewrite_mock:
+            chat_core._build_messages_with_timings("你好", session)
+
+        rewrite_mock.assert_called_once()
+        self.assertEqual(len(fake_memory.search_calls), 1)
+        query, _, _ = fake_memory.search_calls[0]
+        self.assertEqual(query, "english retrieval query")
+
+    def test_build_messages_falls_back_to_source_query_when_rewrite_fails(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", True), patch.object(
+            chat_core,
+            "_rewrite_memory_query_to_english",
+            side_effect=RuntimeError("rewrite failed"),
+        ):
+            chat_core._build_messages_with_timings("原始问题", session)
 
         self.assertEqual(len(fake_memory.search_calls), 1)
         query, _, _ = fake_memory.search_calls[0]
-        self.assertEqual(query, "还有呢")
+        self.assertEqual(query, "原始问题")
 
-    def test_first_memory_batch_flushes_after_five_rounds(self):
+    def test_build_messages_skips_query_rewrite_when_disabled(self):
         fake_memory = FakeMemoryStore()
-
-        class FakeExecutor:
-            def __init__(self):
-                self.submissions = []
-
-            def submit(self, fn, *args, **kwargs):
-                self.submissions.append((fn, args, kwargs))
-
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        chat_core.executor = FakeExecutor()
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
 
-        for index in range(5):
-            chat_core.update_window(f"u{index}", f"a{index}", session)
+        with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", False), patch.object(
+            chat_core,
+            "_rewrite_memory_query_to_english",
+            side_effect=AssertionError("rewrite should not run"),
+        ):
+            chat_core._build_messages_with_timings("直接检索", session)
 
-        self.assertEqual(len(chat_core.executor.submissions), 1)
-        fn, args, kwargs = chat_core.executor.submissions[0]
-        self.assertEqual(fn.__name__, "_persist_memory_batch")
-        self.assertEqual(args[1], scope)
-        self.assertEqual(args[2], 5)
-        self.assertEqual(len(args[0]), 10)
-        self.assertEqual(len(session.memory_round_buffer), 2)
-        self.assertEqual(session.memory_flush_count, 1)
-        self.assertEqual(session.memory_round_buffer[0][0]["content"], "u3")
-        self.assertEqual(kwargs, {})
+        self.assertEqual(len(fake_memory.search_calls), 1)
+        query, _, _ = fake_memory.search_calls[0]
+        self.assertEqual(query, "直接检索")
 
-    def test_second_memory_batch_flushes_after_three_new_rounds_with_overlap(self):
+    def test_query_rewrite_call_is_separate_from_main_chat_model_call(self):
         fake_memory = FakeMemoryStore()
-
-        class FakeExecutor:
-            def __init__(self):
-                self.submissions = []
-
-            def submit(self, fn, *args, **kwargs):
-                self.submissions.append((fn, args, kwargs))
-
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        chat_core.executor = FakeExecutor()
-        scope = chat_core_module.SessionScope("alice", "agent-1")
-        session = chat_core.get_or_create_session(scope)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "english retrieval query"}}]},
+            },
+        )()
 
-        for index in range(8):
-            chat_core.update_window(f"u{index}", f"a{index}", session)
+        with patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock:
+            rewritten = chat_core._rewrite_memory_query_to_english("原始问题")
+            reply = chat_core.call_model([{"role": "user", "content": "原始问题"}])
 
-        self.assertEqual(len(chat_core.executor.submissions), 2)
-        _, args, _ = chat_core.executor.submissions[1]
-        self.assertEqual(args[2], 5)
-        self.assertEqual(len(args[0]), 10)
-        self.assertEqual(args[0][0]["content"], "u3")
-        self.assertEqual(args[0][-1]["content"], "a7")
-        self.assertEqual(len(session.memory_round_buffer), 2)
-        self.assertEqual(session.memory_round_buffer[0][0]["content"], "u6")
-        self.assertEqual(session.memory_flush_count, 2)
+        self.assertEqual(rewritten, "english retrieval query")
+        self.assertEqual(reply, "english retrieval query")
+        self.assertEqual(post_mock.call_count, 2)
+        first_payload = post_mock.call_args_list[0].kwargs["json"]
+        second_payload = post_mock.call_args_list[1].kwargs["json"]
+        self.assertIn("messages", first_payload)
+        self.assertIn("messages", second_payload)
+        self.assertEqual(second_payload["messages"][-1]["content"], "原始问题")
 
     def test_persist_memory_batch_passes_scope_ids_to_mem0(self):
         fake_memory = FakeMemoryStore()
@@ -205,15 +221,14 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         output = io.StringIO()
         with patch.object(chat_core, "call_model", return_value="ok"), redirect_stdout(output):
-            result = chat_core.chat("你好", "alice", "agent-1")
+            result = chat_core.chat("hi", "alice", "agent-1")
 
         self.assertTrue(result["success"])
-        self.assertIn("本轮模型请求提示词", output.getvalue())
         self.assertIn("agent_id=agent-1", output.getvalue())
         self.assertNotIn("run_id=", output.getvalue())
         self.assertIn("role=system", output.getvalue())
         self.assertIn("role=user", output.getvalue())
-        self.assertIn("你好", output.getvalue())
+        self.assertIn("hi", output.getvalue())
 
     def test_call_model_disables_reasoning_when_switch_off(self):
         fake_memory = FakeMemoryStore()
@@ -229,7 +244,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with (
             patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
-            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "CHAT_MODEL_NAME", "moonshot/kimi2.5"),
             patch.object(chat_core_module.config, "REASONING_ENABLED", False),
         ):
             content = chat_core.call_model([{"role": "user", "content": "hello"}])
@@ -254,7 +269,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with (
             patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock,
-            patch.object(chat_core_module.config, "MODEL_NAME", "moonshot/kimi2.5"),
+            patch.object(chat_core_module.config, "CHAT_MODEL_NAME", "moonshot/kimi2.5"),
             patch.object(chat_core_module.config, "REASONING_ENABLED", True),
         ):
             content = chat_core.call_model([{"role": "user", "content": "hello"}])
@@ -286,7 +301,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             patch.object(chat_core, "call_model", return_value="ok"),
             patch.object(chat_core, "update_window"),
         ):
-            result = chat_core.chat("你好", "alice", "agent-1")
+            result = chat_core.chat("hi", "alice", "agent-1")
 
         self.assertTrue(result["success"])
         self.assertEqual(result["duration"], 12.0)
@@ -304,7 +319,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             memories = chat_core.search_memories("hi", scope)
 
         self.assertEqual(memories, [])
-        self.assertIn("记忆检索失败", output.getvalue())
+        self.assertIn("error=", output.getvalue())
 
     def test_persist_memory_batch_logs_error_without_raising(self):
         fake_memory = FakeMemoryStore()
@@ -316,7 +331,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             with redirect_stdout(output):
                 chat_core._persist_memory_batch([{"role": "user", "content": "hi"}], scope, 10)
 
-        self.assertIn("记忆保存失败", output.getvalue())
+        self.assertIn("error=", output.getvalue())
 
     def test_build_messages_includes_current_time_in_system_prompt(self):
         fake_memory = FakeMemoryStore()
@@ -325,10 +340,9 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with patch.object(chat_core, "_get_current_time_text", return_value="2026-04-28 09:30:45 CST"):
             session = chat_core.get_or_create_session(scope)
-            messages = chat_core.build_messages("你好", session)
+            messages = chat_core.build_messages("hi", session)
 
         self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("当前时间", messages[0]["content"])
         self.assertIn("2026-04-28 09:30:45 CST", messages[0]["content"])
 
 
