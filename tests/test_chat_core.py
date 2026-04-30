@@ -95,35 +95,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             },
         )
 
-    def test_follow_up_query_is_rewritten_with_last_round_context(self):
-        fake_memory = FakeMemoryStore()
-        chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        scope = chat_core_module.SessionScope("alice", "agent-1")
-        session = chat_core.get_or_create_session(scope)
-        session.conversation_window = [
-            {"role": "user", "content": "你平时做什么工作"},
-            {"role": "assistant", "content": "我平时做工程相关的活"},
-        ]
-
-        source_query, was_expanded = chat_core._build_memory_query("还有呢", session)
-
-        self.assertTrue(was_expanded)
-        self.assertIn("你平时做什么工作", source_query)
-        self.assertIn("我平时做工程相关的活", source_query)
-        self.assertIn("还有呢", source_query)
-
-    def test_follow_up_query_without_context_falls_back_to_original_input(self):
-        fake_memory = FakeMemoryStore()
-        chat_core_module, chat_core = self._load_chat_core(fake_memory)
-        scope = chat_core_module.SessionScope("alice", "agent-1")
-        session = chat_core.get_or_create_session(scope)
-
-        source_query, was_expanded = chat_core._build_memory_query("还有呢", session)
-
-        self.assertFalse(was_expanded)
-        self.assertEqual(source_query, "还有呢")
-
-    def test_build_messages_uses_english_rewrite_before_memory_search_when_enabled(self):
+    def test_build_messages_uses_rewritten_query_before_memory_search_when_enabled(self):
         fake_memory = FakeMemoryStore()
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
         scope = chat_core_module.SessionScope("alice", "agent-1")
@@ -131,25 +103,29 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", True), patch.object(
             chat_core,
-            "_rewrite_memory_query_to_english",
-            return_value="english retrieval query",
+            "_rewrite_memory_query",
+            return_value="用户 前女友 感情关系 联系 近期状态",
         ) as rewrite_mock:
             chat_core._build_messages_with_timings("你好", session)
 
         rewrite_mock.assert_called_once()
         self.assertEqual(len(fake_memory.search_calls), 1)
         query, _, _ = fake_memory.search_calls[0]
-        self.assertEqual(query, "english retrieval query")
+        self.assertEqual(query, "用户 前女友 感情关系 联系 近期状态")
 
-    def test_build_messages_falls_back_to_source_query_when_rewrite_fails(self):
+    def test_build_messages_falls_back_to_original_input_when_rewrite_fails(self):
         fake_memory = FakeMemoryStore()
         chat_core_module, chat_core = self._load_chat_core(fake_memory)
         scope = chat_core_module.SessionScope("alice", "agent-1")
         session = chat_core.get_or_create_session(scope)
+        session.conversation_window = [
+            {"role": "user", "content": "我前女友昨天找我了"},
+            {"role": "assistant", "content": "你怎么想"},
+        ]
 
         with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", True), patch.object(
             chat_core,
-            "_rewrite_memory_query_to_english",
+            "_rewrite_memory_query",
             side_effect=RuntimeError("rewrite failed"),
         ):
             chat_core._build_messages_with_timings("原始问题", session)
@@ -166,7 +142,7 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with patch.object(chat_core_module.config, "MEM0_QUERY_REWRITE_ENABLED", False), patch.object(
             chat_core,
-            "_rewrite_memory_query_to_english",
+            "_rewrite_memory_query",
             side_effect=AssertionError("rewrite should not run"),
         ):
             chat_core._build_messages_with_timings("直接检索", session)
@@ -174,6 +150,25 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(len(fake_memory.search_calls), 1)
         query, _, _ = fake_memory.search_calls[0]
         self.assertEqual(query, "直接检索")
+
+    def test_build_messages_keeps_rewrite_and_memory_search_for_self_disclosure(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(
+            chat_core,
+            "_rewrite_memory_query",
+            return_value="用户想表达前女友昨天主动联系了自己这件事",
+        ) as rewrite_mock:
+            messages, timings = chat_core._build_messages_with_timings("我前女友昨天找我了", session)
+
+        rewrite_mock.assert_called_once()
+        self.assertEqual(messages[1]["content"], "我前女友昨天找我了")
+        self.assertEqual(len(fake_memory.search_calls), 1)
+        self.assertGreaterEqual(timings["memory_search_duration"], 0.0)
+        self.assertIn("暂无", messages[0]["content"])
 
     def test_query_rewrite_call_is_separate_from_main_chat_model_call(self):
         fake_memory = FakeMemoryStore()
@@ -183,22 +178,157 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             (),
             {
                 "raise_for_status": lambda self: None,
-                "json": lambda self: {"choices": [{"message": {"content": "english retrieval query"}}]},
+                "json": lambda self: {"choices": [{"message": {"content": "用户想确认前女友现在的状态和最近联系后的变化"}}]},
             },
         )()
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+        session.conversation_window = [
+            {"role": "user", "content": "我前女友昨天找我了"},
+            {"role": "assistant", "content": "你怎么想"},
+        ]
 
         with patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock:
-            rewritten = chat_core._rewrite_memory_query_to_english("原始问题")
+            rewritten = chat_core._rewrite_memory_query("她是不是还是那样", session)
             reply = chat_core.call_model([{"role": "user", "content": "原始问题"}])
 
-        self.assertEqual(rewritten, "english retrieval query")
-        self.assertEqual(reply, "english retrieval query")
+        self.assertEqual(rewritten, "用户想确认前女友现在的状态和最近联系后的变化")
+        self.assertEqual(reply, "用户想确认前女友现在的状态和最近联系后的变化")
         self.assertEqual(post_mock.call_count, 2)
         first_payload = post_mock.call_args_list[0].kwargs["json"]
         second_payload = post_mock.call_args_list[1].kwargs["json"]
         self.assertIn("messages", first_payload)
         self.assertIn("messages", second_payload)
         self.assertEqual(second_payload["messages"][-1]["content"], "原始问题")
+        self.assertIn("最近两轮对话", first_payload["messages"][0]["content"])
+        self.assertIn("当前用户问题", first_payload["messages"][0]["content"])
+
+    def test_query_rewrite_prompt_uses_recent_two_rounds_without_scope(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "用户想了解父亲最近住院后的当前恢复情况"}}]},
+            },
+        )()
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+        session.conversation_window = [
+            {"role": "user", "content": "更早的第一句"},
+            {"role": "assistant", "content": "更早的第一句回复"},
+            {"role": "user", "content": "我前天去医院看他了"},
+            {"role": "assistant", "content": "医生怎么说"},
+            {"role": "user", "content": "我爸最近住院"},
+            {"role": "assistant", "content": "现在情况稳定点了吗"},
+        ]
+
+        with patch.object(chat_core_module.requests, "post", return_value=fake_response) as post_mock:
+            chat_core._rewrite_memory_query("他现在怎么样", session)
+
+        prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertNotIn("user_id:", prompt)
+        self.assertNotIn("agent_id:", prompt)
+        self.assertNotIn("更早的第一句", prompt)
+        self.assertNotIn("更早的第一句回复", prompt)
+        self.assertIn("最近两轮对话", prompt)
+        self.assertIn("适合向量检索的一句话", prompt)
+        self.assertIn("用户：我前天去医院看他了", prompt)
+        self.assertIn("王建国：医生怎么说", prompt)
+        self.assertIn("用户：我爸最近住院", prompt)
+        self.assertIn("王建国：现在情况稳定点了吗", prompt)
+        self.assertIn("当前用户问题：", prompt)
+        self.assertIn("他现在怎么样", prompt)
+
+    def test_query_rewrite_uses_first_non_empty_line(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "\n用户想了解父亲住院后的当前身体状况\n补充说明"}}]},
+            },
+        )()
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(chat_core_module.requests, "post", return_value=fake_response):
+            rewritten = chat_core._rewrite_memory_query("他现在怎么样", session)
+
+        self.assertEqual(rewritten, "用户想了解父亲住院后的当前身体状况")
+
+    def test_query_rewrite_logs_duration_and_rewritten_query(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "用户想了解父亲住院后的当前身体状况"}}]},
+            },
+        )()
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        output = io.StringIO()
+        with (
+            patch.object(chat_core_module.requests, "post", return_value=fake_response),
+            redirect_stdout(output),
+        ):
+            chat_core._rewrite_memory_query("他现在怎么样", session)
+
+        log_text = output.getvalue()
+        self.assertIn("memory query rewrite", log_text)
+        self.assertIn("duration=", log_text)
+        self.assertIn("rewritten_query=用户想了解父亲住院后的当前身体状况", log_text)
+
+    def test_query_rewrite_recent_context_keeps_only_last_two_complete_rounds(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+        session.conversation_window = [
+            {"role": "user", "content": "第一轮用户"},
+            {"role": "assistant", "content": "第一轮助手"},
+            {"role": "user", "content": "第二轮用户"},
+            {"role": "assistant", "content": "第二轮助手"},
+            {"role": "user", "content": "第三轮用户"},
+            {"role": "assistant", "content": "第三轮助手"},
+        ]
+
+        formatted = chat_core._format_conversation_history(
+            chat_core._get_recent_complete_round_messages(session, rounds=2)
+        )
+
+        self.assertNotIn("第一轮用户", formatted)
+        self.assertNotIn("第一轮助手", formatted)
+        self.assertIn("第二轮用户", formatted)
+        self.assertIn("王建国：第二轮助手", formatted)
+        self.assertIn("第三轮用户", formatted)
+        self.assertIn("王建国：第三轮助手", formatted)
+
+    def test_query_rewrite_raises_when_model_returns_empty_content(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        fake_response = type(
+            "ResponseStub",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"choices": [{"message": {"content": "   \n  "}}]},
+            },
+        )()
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(chat_core_module.requests, "post", return_value=fake_response):
+            with self.assertRaisesRegex(RuntimeError, "empty rewritten query"):
+                chat_core._rewrite_memory_query("他现在怎么样", session)
 
     def test_persist_memory_batch_passes_scope_ids_to_mem0(self):
         fake_memory = FakeMemoryStore()
@@ -215,6 +345,23 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
         self.assertEqual(add_call["agent_id"], "agent-1")
         self.assertIsNone(add_call["run_id"])
 
+    def test_update_window_normalizes_assistant_output_to_single_line(self):
+        fake_memory = FakeMemoryStore()
+        chat_core_module, chat_core = self._load_chat_core(fake_memory)
+        scope = chat_core_module.SessionScope("alice", "agent-1")
+        session = chat_core.get_or_create_session(scope)
+
+        with patch.object(chat_core.executor, "submit"):
+            chat_core.update_window("你在干嘛", "我刚下班\n准备回家  \n路上有点堵", session)
+
+        self.assertEqual(
+            session.conversation_window,
+            [
+                {"role": "用户", "content": "你在干嘛"},
+                {"role": "王建国", "content": "我刚下班 准备回家 路上有点堵"},
+            ],
+        )
+
     def test_chat_prints_prompt_messages_before_model_call(self):
         fake_memory = FakeMemoryStore()
         _, chat_core = self._load_chat_core(fake_memory)
@@ -224,8 +371,8 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
             result = chat_core.chat("hi", "alice", "agent-1")
 
         self.assertTrue(result["success"])
+        self.assertIn("本轮模型请求提示词", output.getvalue())
         self.assertIn("agent_id=agent-1", output.getvalue())
-        self.assertNotIn("run_id=", output.getvalue())
         self.assertIn("role=system", output.getvalue())
         self.assertIn("role=user", output.getvalue())
         self.assertIn("hi", output.getvalue())
@@ -340,10 +487,17 @@ class ChatCoreMem0IntegrationTests(unittest.TestCase):
 
         with patch.object(chat_core, "_get_current_time_text", return_value="2026-04-28 09:30:45 CST"):
             session = chat_core.get_or_create_session(scope)
+            session.conversation_window = [
+                {"role": "用户", "content": "最近怎么样"},
+                {"role": "王建国", "content": "还行，就那样"},
+            ]
             messages = chat_core.build_messages("hi", session)
 
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("2026-04-28 09:30:45 CST", messages[0]["content"])
+        self.assertIn("用户：最近怎么样", messages[0]["content"])
+        self.assertIn("王建国：还行，就那样", messages[0]["content"])
+        self.assertNotIn("我：最近怎么样", messages[0]["content"])
 
 
 class Mem0CompatPatchTests(unittest.TestCase):

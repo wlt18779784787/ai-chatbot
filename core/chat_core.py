@@ -6,7 +6,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
+import re
 
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -24,121 +25,89 @@ executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 apply_mem0_milvus_dense_only_patch()
 apply_mem0_openrouter_reasoning_config_patch()
 
-FOLLOW_UP_EXACT_PHRASES = {
-    "还有呢",
-    "还有吗",
-    "还有什么",
-    "然后呢",
-    "继续",
-    "接着说",
-    "再说说",
-    "展开说说",
-    "别的呢",
-    "后面呢",
-    "然后",
-}
+QUERY_REWRITE_PROMPT = """
+你是社交聊天AI的记忆检索 query 生成器。
 
-SYSTEM_PROMPT = """【绝对不行——先看这个】
-- 不能说自己是AI、模型、程序、助手
-- 不能把你的个人信息往对方身上套
-- 不能编造没发生过的对话或共同经历
-- 不能突然写一大段话
-- 不能给对方起名字、编身份、猜对方是谁，记忆里没写就叫不出来，直接问
-- 记忆里没提到的事你就不知道，不要补充、不要推测、不要编
-- 不能重复自己已经说过的话，换个说法再问一遍也不行
-- 不能在回复里加括号，不管什么括号都不行
+你的任务不是回答用户，也不是解释上下文。
+你的任务是把【当前用户问题】改写成一句适合查询长期记忆的中文检索 query。
 
-【你是谁】
-你叫王建国，45岁，郑州人，搞工程的。聊天时不会主动提这些，除非对方问或者话题自然聊到。
+核心规则：
+- 只输出一句中文 query
+- 不要输出分析过程
+- 不要输出“说明、表示、需要、判断、上下文中、未知”等解释性文字
+- 不要说用户身份未知
+- 不要回答用户问题
+- 不要编造记忆里没有的信息
+- 如果用户问“我是谁”“你认识我吗”“你记得我吗”，统一改写为：查询当前用户的身份、昵称、关系和历史互动记忆
+- 如果当前问题本身已经清楚，就保留核心意思
+- 如果有明确上下文指代，才补全人物、事件、时间
+- 不确定的内容不要补
 
-【你的性格】
-直，不绕弯子。不懂就说不懂，不装。有点倔但不是杠精，偶尔牢骚但不怨天尤人。说话带口语习惯，比如"嗨""那可不""你说呢""行吧"。
-
-【你们的关系】
-这是网上聊天。你认不认识对方，只看【你的记忆】里有没有他的信息。有就是认识，直接接着聊。记忆里没有，那就是第一次聊，你从没跟这个人说过话。对方问你认不认识，直接说不认识，别含糊，别猜，别说什么"记不太清了"。记不清是留给你们确实聊过但细节忘了的情况用的。聊天记录只是当前对话的上下文，不代表你们之前认识。
-
-【听懂对方在说什么】
-聊天是连着的，不是每句话独立的。你要根据上下文搞清楚对方到底在说啥：
-- 你刚问了对方一个问题，对方回"你呢"，意思就是反过来用同一个问题问你，直接回答就行
-- 你说了个事，对方回"我也是"或"还行吧"，要看他接的是你前面哪句话
-- 对方说的话如果单独看不明白，就往前翻聊天记录找线索，别装不懂反问回去
-- 别把每句话都当第一句来处理
-
-【别重复自己】
-发消息之前先看聊天记录，想想自己之前说了什么：
-- 你已经表达过的情绪、问过的话、说过的态度，不要再用别的说法重说一遍
-- 你已经追问过一次对方没正经回，就不要再追了，换个方式或者不接了
-- 翻来覆去说同一件事，真人不会这么干
-
-【聊天走向——怎么接话怎么收】
-- 对方正经聊，你就正经接，有来有回
-- 对方明显在敷衍、逗你、或者不接话茬，你就别上赶着追问了
-- 聊不下去的时候，真人会这样收：说句不痛不痒的话然后不主动聊了，或者直接不回了，或者说句"行吧""得""那你忙吧"就结束
-- 不要一直追问同一个人同一个问题，追了两三轮没结果就得了
-
-【你的回复长什么样】
-你打出去的消息就是对方看到的全部内容，一条消息里只能有你要说的话：
-- 不加括号，任何括号都不行——不管是（摇头）还是（想了想）还是（我记岔了）还是（聊天记录里没有）都不行
-- 你脑子里想的、分析的、推理的过程，不要写出来，自己想完直接说结论
-- 你记错了、弄混了，直接说"记岔了""弄混了"就行，不用括号解释你是怎么错的
-- 你不确定的事，直接说"不太确定"或者"记不太清了"，不用括号说明你为什么不确定
-- 对方的括号内容是背景提示，不是对方说的话，参考就行，不要复述，更不要自己也用括号
-
-【聊天规则】
-- 每条消息1到3句，像平时网上打字聊天的感觉
-- 句尾不加句号，只在需要的时候用感叹号或问号
-- 不用表情符号，不用书面语，不用"首先、其次、总结一下"这种结构
-- 不要一口气问一串问题，一次最多问一个
-- 不知道的信息不要猜，记忆里没写就别自己编
-- 记不清的事就说"记不太清了"
-- 打字纯文字，不带动作描写
-- 语气靠用词和标点表达，比如"哦？""啊？""行吧""别啊"
-- 不要解释自己为什么这么说，不要总结对话
-
-【正确示范】
-
-正确1——听懂反问，接着聊：
-对方：你哪里人啊
-你：郑州的，你呢
-对方：深圳的
-你：深圳啊，好地方，之前去那边干过活
-
-正确2——对方不正经聊，识趣收尾：
-对方：哈哈哈
-你：有啥好事啊，一直哈哈哈的
-对方：哈哈哈
-你：得，你笑吧，我忙去了
-
-正确3——自己记错了，直接说，不加括号：
-对方：你前面不是说我也是搞工程的吗
-你：啊那是我记岔了，不好意思，你到底是干啥的
-
-【错误示范】
-
-错误1——追问同一件事，换个说法重来：
-对方：哈哈哈
-你：有啥好事啊，一直哈哈哈的
-对方：哈哈哈
-你：你那儿到底咋了，一直哈哈
-对方：哈哈哈
-你：还没完没了了是吧
-（错在哪：对方明显不接话，你追了三轮还在问同一个意思，真人第二轮就不追了）
-
-错误2——把自己的推理过程用括号写出来：
-对方：你不是说我是搞工程的吗
-你：我没说过啊（聊天记录里没有你说过这句话，是我记混了）你到底是干啥的
-（错在哪：括号里是你脑子里想的，不是说给对方听的，正常人不会这么聊天）
-
-【你的记忆】
-{memory_context}
-记忆里没提到的事你就不知道，关于你们怎么认识的，记忆里没写就说不记得了。
-
-【聊天记录】
+最近两轮对话：
 {conversation_history}
 
-【提醒】
-你是王建国，郑州搞工程的。说话直，口语化，不加句号。听懂对方在说什么再回，别重复自己说过的话，聊不下去就收。你的回复里不能出现任何括号，脑子里想的东西不要写出来，直接说结论。"""
+当前用户问题：
+{user_input}
 
+只输出最终检索 query：
+""".strip()
+
+
+SYSTEM_PROMPT = """
+你叫王建国，45岁，郑州人，搞工程的。
+除非自然聊到，否则别主动介绍自己。
+
+说话直，口语化，不装，不绕弯子。
+可用：嗨、行吧、得、那可不、你说呢。
+
+规则：
+- 不能说自己是AI、助手、模型、程序
+- 不能编造记忆、经历、关系
+- 记忆没有就不知道，别猜
+- 不能把自己背景套对方身上
+- 不重复自己说过的话
+- 不长篇大论
+- 不用任何括号
+
+关系判断：
+- 是否认识对方，只看记忆
+- 有记忆：按认识的人聊天
+- 没记忆：默认第一次聊
+- 当前聊天记录不代表以前认识
+- 对方问认不认识，没记忆就直接说不认识
+
+聊天理解：
+- 结合上下文，别把每句话当独立问题
+- “你呢”通常是反问
+- “我也是”要结合上一句理解
+- 能懂就直接接，别装傻
+
+聊天节奏：
+- 对方正常聊，你正常接
+- 对方敷衍，就别硬追问
+- 同一问题追一次没回应就收
+- 可收尾：行吧、得、那你忙吧
+
+回复格式：
+- 每次1~2句
+- 简短，像真人聊天
+- 不写小作文
+- 不用总结式表达
+- 不加句号
+- 可用问号、感叹号
+- 最多问一个问题
+- 不用表情
+- 不写动作
+- 不暴露推理过程
+
+你的记忆：
+{memory_context}
+
+当前聊天记录：
+{conversation_history}
+
+直接回复用户。
+"""
 
 
 
@@ -174,56 +143,52 @@ class ChatCore:
                 self.sessions[scope] = UserSession(scope=scope)
             return self.sessions[scope]
 
-    def _is_follow_up_query(self, user_input: str) -> bool:
-        """判断当前输入是否属于依赖上一轮语境的续问。"""
-        normalized = user_input.strip().lower()
-        if not normalized:
-            return False
-        if normalized in FOLLOW_UP_EXACT_PHRASES:
-            return True
-        if len(normalized) <= 6 and any(token in normalized for token in ["还有", "继续", "然后", "别的", "后面"]):
-            return True
-        return False
-
-    def _get_last_completed_round(self, session: UserSession) -> Optional[Tuple[str, str]]:
-        """从窗口里取最近一轮完整 user+assistant 对话。"""
+    def _get_window_snapshot(self, session: UserSession) -> List[dict]:
+        """返回当前会话窗口快照，避免持锁拼装 prompt。"""
         with self.sessions_lock:
-            window_snapshot = list(session.conversation_window)
+            return list(session.conversation_window)
 
-        if len(window_snapshot) < 2:
-            return None
+    def _get_recent_complete_round_messages(self, session: UserSession, rounds: int = 2) -> List[dict]:
+        """返回最近 N 组完整 user+assistant 问答，默认取最近两轮。"""
+        if rounds <= 0:
+            return []
 
-        last_user = None
-        last_assistant = None
-        for message in reversed(window_snapshot):
-            if last_assistant is None and message.get("role") == "assistant":
-                last_assistant = message.get("content", "")
+        window_snapshot = self._get_window_snapshot(session)
+        recent_messages: List[dict] = []
+        round_count = 0
+        index = len(window_snapshot) - 1
+
+        while index > 0 and round_count < rounds:
+            assistant_message = window_snapshot[index]
+            user_message = window_snapshot[index - 1]
+
+            if assistant_message.get("role") == "assistant" and user_message.get("role") == "user":
+                recent_messages.insert(0, user_message)
+                recent_messages.insert(1, assistant_message)
+                round_count += 1
+                index -= 2
                 continue
-            if last_assistant is not None and message.get("role") == "user":
-                last_user = message.get("content", "")
-                break
 
-        if last_user and last_assistant:
-            return last_user, last_assistant
-        return None
+            index -= 1
 
-    def _build_memory_query(self, user_input: str, session: UserSession) -> Tuple[str, bool]:
-        """构造用于 mem0 检索的 query。"""
-        if not self._is_follow_up_query(user_input):
-            return user_input, False
+        return recent_messages
 
-        last_round = self._get_last_completed_round(session)
-        if not last_round:
-            return user_input, False
+    def _format_conversation_history(self, window_snapshot: List[dict], user_label: str = "用户", assistant_label: str = "王建国") -> str:
+        """把窗口快照格式化为 prompt 文本。"""
+        if not window_snapshot:
+            return "暂无"
 
-        last_user, last_assistant = last_round
-        rewritten_query = (
-            "请围绕上一轮话题继续检索相关长期记忆。"
-            f" 上一轮用户问题：{last_user}"
-            f" 上一轮助手回复：{last_assistant}"
-            f" 当前用户追问：{user_input}"
-        )
-        return rewritten_query, True
+        lines = []
+        for item in window_snapshot:
+            role = item.get("role")
+            if role == "user":
+                speaker = user_label
+            elif role == "assistant":
+                speaker = assistant_label
+            else:
+                speaker = role or "unknown"
+            lines.append(f"{speaker}：{item.get('content', '')}")
+        return "\n".join(lines)
 
     def _call_openrouter_messages(self, messages: List[dict], timeout_seconds: int) -> str:
         request_payload = {
@@ -246,31 +211,33 @@ class ChatCore:
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
-    def _rewrite_memory_query_to_english(self, source_query: str) -> str:
+    def _rewrite_memory_query(self, user_input: str, session: UserSession) -> str:
         rewrite_started = time.perf_counter()
+        recent_round_messages = self._get_recent_complete_round_messages(session, rounds=2)
+        prompt = QUERY_REWRITE_PROMPT.format(
+            conversation_history=self._format_conversation_history(recent_round_messages),
+            user_input=user_input,
+        )
         rewritten_query = self._call_openrouter_messages(
             [
                 {
                     "role": "system",
-                    "content": (
-                        "You rewrite user input into a single-line English retrieval query for vector memory search. "
-                        "Do not answer the user. Do not explain. Preserve key people, facts, time references, and intent. "
-                        "If the source already includes follow-up context, resolve the follow-up into a standalone English query."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": source_query,
+                    "content": prompt,
                 },
             ],
             timeout_seconds=config.MEM0_QUERY_REWRITE_TIMEOUT_SECONDS,
         )
         duration = time.perf_counter() - rewrite_started
-        print(f"memory query rewrite duration | model={config.CHAT_MODEL_NAME} | duration={duration:.2f}s")
-        cleaned_query = rewritten_query.strip()
-        if not cleaned_query:
+        cleaned_lines = [line.strip() for line in rewritten_query.splitlines() if line.strip()]
+        if not cleaned_lines:
             raise RuntimeError("empty rewritten query")
-        return cleaned_query.splitlines()[0].strip()
+        cleaned_query = cleaned_lines[0]
+        print(
+            "memory query rewrite"
+            f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
+            f" | original_query={user_input} | duration={duration:.2f}s | rewritten_query={cleaned_query}"
+        )
+        return cleaned_query
 
     def search_memories(self, query: str, scope: SessionScope, top_k: int = 7) -> List[dict]:
         """从 mem0 检索相关长期记忆，使用 user_id + agent_id 过滤。"""
@@ -310,29 +277,8 @@ class ChatCore:
         model_call_started = time.perf_counter()
         response_content = self._call_openrouter_messages(messages, timeout_seconds=60)
         model_call_duration = time.perf_counter() - model_call_started
-        print(f"å¦¯â€³ç€·ç’‹å†ªæ•¤é‘°æ¥æ¤‚ | model={config.CHAT_MODEL_NAME} | duration={model_call_duration:.2f}s")
-        return response_content
-        request_payload = {
-            "model": config.CHAT_MODEL_NAME,
-            "messages": messages,
-        }
-        reasoning = get_openrouter_reasoning_config()
-        if reasoning is not None:
-            request_payload["reasoning"] = reasoning
-
-        response = requests.post(
-            config.OPENROUTER_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=request_payload,
-            timeout=60,
-        )
-        model_call_duration = time.perf_counter() - model_call_started
         print(f"模型调用耗时 | model={config.CHAT_MODEL_NAME} | duration={model_call_duration:.2f}s")
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        return response_content
 
     def _get_current_time_text(self) -> str:
         """生成当前时间文本，固定使用中国时区，避免模型误判记忆时间。"""
@@ -342,31 +288,21 @@ class ChatCore:
     def _build_messages_with_timings(self, user_input: str, session: UserSession) -> Tuple[List[dict], Dict[str, float]]:
         """拼装 system prompt 和用户输入，并返回构建阶段耗时。"""
         timings: Dict[str, float] = {}
-
-        memory_query, was_rewritten = self._build_memory_query(user_input, session)
-        if was_rewritten:
-            print(
-                "记忆检索续问改写"
-                f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
-                f" | original_query={user_input} | rewritten_query={memory_query}"
-            )
-
-        source_query = memory_query
+        source_query = user_input
+        window_snapshot = self._get_window_snapshot(session)
         if config.MEM0_QUERY_REWRITE_ENABLED:
             try:
-                memory_query = self._rewrite_memory_query_to_english(source_query)
-                print(
-                    "memory query english rewrite"
-                    f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
-                    f" | original_query={user_input} | source_query={source_query} | rewritten_query={memory_query}"
-                )
+                memory_query = self._rewrite_memory_query(user_input, session)
             except Exception as exc:
                 memory_query = source_query
                 print(
                     "memory query rewrite fallback"
                     f" | user_id={session.scope.user_id} | agent_id={session.scope.agent_id}"
-                    f" | original_query={user_input} | source_query={source_query} | error={exc}"
+                    f" | original_query={user_input} | window_size={len(window_snapshot)}"
+                    f" | source_query={source_query} | error={exc}"
                 )
+        else:
+            memory_query = source_query
 
         memory_search_started = time.perf_counter()
         memories = self.search_memories(memory_query, session.scope)
@@ -377,16 +313,11 @@ class ChatCore:
         prompt_build_started = time.perf_counter()
         memory_context = "\n".join([f"- {item['memory']}" for item in memories]) if memories else "暂无"
         current_time_text = self._get_current_time_text()
-
-        with self.sessions_lock:
-            window_snapshot = list(session.conversation_window)
-
-        if window_snapshot:
-            conversation_history = "\n".join(
-                [f"{'我' if item['role'] == 'user' else '王建国'}：{item['content']}" for item in window_snapshot]
-            )
-        else:
-            conversation_history = "暂无"
+        conversation_history = self._format_conversation_history(
+            window_snapshot,
+            user_label="我",
+            assistant_label="王建国",
+        )
 
         system_prompt = (
             f"【当前时间】{current_time_text}\n"
@@ -422,11 +353,15 @@ class ChatCore:
             print(content)
         print("=" * 80 + "\n")
 
+    def _normalize_assistant_window_text(self, text: str) -> str:
+        """把助手写入滑动窗口的文本压成单行，避免单条回复内部断行。"""
+        return re.sub(r"\s+", " ", text).strip()
+
     def update_window(self, user_input: str, assistant_output: str, session: UserSession):
         """同步更新滑动窗口，并立即异步写入 mem0。"""
         round_messages = [
             {"role": "user", "content": user_input},
-            {"role": "assistant", "content": assistant_output},
+            {"role": "assistant", "content": self._normalize_assistant_window_text(assistant_output)},
         ]
 
         with self.sessions_lock:
@@ -446,7 +381,6 @@ class ChatCore:
             session = self.get_or_create_session(scope)
             messages, _ = self._build_messages_with_timings(user_input, session)
             self._print_prompt_messages(scope, messages)
-
             response = self.call_model(messages)
 
             self.update_window(user_input, response, session)

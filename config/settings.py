@@ -109,6 +109,18 @@ def get_mem0_oss_config() -> dict:
             "config": vector_store_config,
         },
         "history_db_path": Config.MEM0_HISTORY_DB_PATH,
+        "custom_instructions": """
+        请使用中文提取和存储记忆内容。
+    
+        要求：
+        - 所有提取结果必须使用中文
+        - 保持原有提取逻辑不变
+        - 不改变原有输出结构
+        - 不改变字段格式
+        - 不新增解释
+        - 不改变原本记忆判断方式
+        - 仅将最终记忆内容改为中文表达
+        """,
     }
 
 
